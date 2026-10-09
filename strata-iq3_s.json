@@ -1,0 +1,41 @@
+{
+ "exe": "/home/bossman/ai/strata/engine/strata",
+ "args": [
+  "--pack",
+  "/home/bossman/ai/Strata-data/packs/iq3_s",
+  "--native",
+  "/home/bossman/ai/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "/home/bossman/ai/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile",
+  "/home/bossman/ai/strata/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto:32768",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "/home/bossman/ai/Strata-data/mtp/rt",
+  "--max-context",
+  "262144",
+  "--kv",
+  "q4_0",
+  "--kv-resident",
+  "32768"
+ ],
+ "cwd": "/home/bossman/ai/strata",
+ "tokenizer": "/home/bossman/ai/Strata-data/packs/iq3_s/tokenizer",
+ "model_name": "qwen3.8-flash-next-iq3_s",
+ "log": "/home/bossman/ai/strata/strata-iq3_s.log",
+ "lib_dirs": [
+  "/usr/local/cuda/bin",
+  "/usr/local/cuda/lib64"
+ ],
+ "port": 8000,
+ "gpu": 0,
+ "gpus_asked": true,
+ "fit_max_tokens": true
+}
