@@ -28,6 +28,15 @@ warm decode ~35-38 tok/s, 45k-token prefill ~1300 tok/s. If either number collap
 When a PR merges, redo the branch against the new main and expect it to become empty:
 `git rebase origin/main avx1-iq-kernels` -> drop the applied commits.
 
+## Profiling (only when needed, revert after)
+
+```
+sudo sysctl kernel.perf_event_paranoid=1 kernel.kptr_restrict=0   # enable perf record
+# ... perf record -F 399 -g -p $(pgrep -f engine/strata) -o /tmp/x.data sleep 30 ...
+sudo sysctl kernel.perf_event_paranoid=2 kernel.kptr_restrict=1   # REVERT (kptr_restrict=0 leaks kernel addrs)
+```
+Both reset to defaults on reboot anyway.
+
 ## Tuned settings that are NOT in the code (survive everything, but check after updates)
 
 - `run-iq3_s.sh`: `export STRATA_IQ_MT_MIN=1` (AVX1 gate/up kernel wins even at nt=1; without it decode gu rows fall back to ggml generic).
