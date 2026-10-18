@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include <immintrin.h>
 
 #include <algorithm>
 #include <chrono>
@@ -179,46 +180,48 @@ void check(const char* what, const std::vector<float>& got, const std::vector<fl
     if (!(r <= 1e-5)) { std::printf("  FAIL %s: rel %.3e > 1e-5 vs ggml-cpu\n", what, r); ++failures; }
 }
 
-// ---- PROTOTYPE (benchmark only, not the engine): IQ2_S with the 10-bit grid indices pre-merged into
-// 16-bit words, so the decode no longer builds them from qs bytes + packed qh bits.
-// If this wins at nt=1 the real version is an offline repack in the pack (tools/iq_pack.py) plus a second
-// gate/up blob pointer in NativeFmt - NOT a runtime repack cache. The GPU tier keeps reading the GGUF.
-// shortcut: duplicates the float stage of iq_avx1.cpp's row_dot_r; delete it once the engine has a repacked rung.
-#include <immintrin.h>
+// ---- PROTOTYPE (benchmark only, not the engine): expert blocks with the pack-time bit packing undone.
+// IQ2_S  (type 22): the 10-bit grid indices already merged into 16-bit words, so the decode stops building
+//                   them from qs bytes + a hi_spread broadcast + punpcklbw + four pextrw.
+// IQ3_XXS (type 18): its grid indices are plain bytes already (nothing to merge), but one 32-bit word per
+//                   32 values carries four 7-bit sign indices plus a 4-bit sub-scale - the unpack is three
+//                   shifts and three masks; store them as bytes instead.
+// IQ3_S  (type 21): both - 9-bit grid indices merged to 16-bit words, and its four sign bytes stored where
+//                   the decode used to run sgn16 (shuffle + and + cmpeq + or) over a loaded u32.
+// The engine is untouched: this lives in the parity tool, which synthesises blobs in memory, so there is no
+// RAM risk and no restart. If it wins, the real version is an offline repack in the pack build
+// (tools/iq_pack.py) plus a second gate/up blob pointer in NativeFmt - NOT a runtime repack cache: the GPU
+// tier keeps reading the GGUF, so ExpertCache::fill_slot* is unaffected.
+// shortcut: duplicates the float stage and the tables of iq_avx1.cpp; delete it once the engine has rungs.
 
-struct Rp22 {                                    // one repacked ggml block (256 values), 106 bytes
-    uint8_t  d[2];                               // 2
-    uint16_t idx[32];                            // 64: 8 groups x 4 grid indices (qs bits | 2 qh bits)
-    uint8_t  sign[32];                           // 32
-    uint8_t  scale[8];                           // 8
+struct Rp22 {                                    // 106 bytes: one repacked 256-value block
+    uint8_t  d[2]; uint16_t idx[32]; uint8_t sign[32]; uint8_t scale[8];
 };
-static_assert(sizeof(Rp22) == 106, "repacked IQ2_S block must be 106 bytes");
+struct Rp18 {                                    // 106 bytes
+    uint8_t  d[2]; uint8_t q[64]; uint8_t sign[32]; uint8_t scale[8];
+};
+struct Rp21 {                                    // 170 bytes
+    uint8_t  d[2]; uint16_t idx[64]; uint8_t sign[32]; uint8_t scale[8];
+};
+static_assert(sizeof(Rp22) == 106 && sizeof(Rp18) == 106 && sizeof(Rp21) == 170,
+              "repacked block sizes");
 
 struct RpSign8 { uint64_t v[256]; RpSign8() : v() {
     for (unsigned i = 0; i < 256; ++i) { uint64_t w = 0;
         for (int k = 0; k < 8; ++k) w |= (uint64_t) (((i >> k) & 1u) ? 0xFFu : 1u) << (8 * k);
         v[i] = w; } } };
+struct RpEvenSigns { uint64_t v[128]; RpEvenSigns() : v() {
+    for (int i = 0; i < 128; ++i) { int par = 0;
+        for (int k = 0; k < 7; ++k) par ^= (i >> k) & 1;
+        const int s = i | (par << 7);            // == ksigns_iq2xs[i]
+        uint64_t r = 0;
+        for (int k = 0; k < 8; ++k) r |= (uint64_t) (((s >> k) & 1) ? 0xFF : 0x01) << (8 * k);
+        v[i] = r; } } };
 struct RpK16 { alignas(16) int16_t v[16][16]; RpK16() : v() {
     for (int k = 0; k < 16; ++k) for (int l = 0; l < 16; ++l) v[k][l] = (int16_t) (2 * k + 1); } };
 static const RpSign8 rp_sign8{};
+static const RpEvenSigns rp_even_signs{};
 static const RpK16 rp_k16{};
-
-void rp22_block(const uint8_t* src, Rp22* dst) {
-    std::memcpy(dst->d, src, 2);
-    const uint8_t* qs = src + 2;                       // 32 grid index bytes
-    const uint8_t* qh = src + 66;                      // 8 bytes, 2 high bits per index
-    for (int h = 0; h < 8; ++h) {
-        const int j = h >> 1, half = h & 1;
-        const uint8_t hq = qh[2 * j + half];
-        const uint8_t* q = qs + 8 * j + 4 * half;
-        dst->idx[4 * h + 0] = (uint16_t) (q[0] | ((hq & 0x03) << 8));
-        dst->idx[4 * h + 1] = (uint16_t) (q[1] | ((hq & 0x0C) << 6));
-        dst->idx[4 * h + 2] = (uint16_t) (q[2] | ((hq & 0x30) << 4));
-        dst->idx[4 * h + 3] = (uint16_t) (q[3] | ((hq & 0xC0) << 2));
-    }
-    std::memcpy(dst->sign,  src + 34, 32);
-    std::memcpy(dst->scale, src + 74, 8);
-}
 
 // fp16 -> fp32, the same bits as iq_avx1.cpp's h2f (fp16 -> fp32 is exact, so any correct conversion matches)
 float h2f_local(uint16_t h) {
@@ -242,35 +245,136 @@ float h2f_local(uint16_t h) {
     float out; std::memcpy(&out, &f, 4); return out;
 }
 
-// one repacked row, the mirror of iq_avx1.cpp's row_dot_r<22, NT, 1> (same accumulators, same order):
-// gate and up are separate calls here exactly as gu_rows does them, so register pressure matches production
-template <int NT>
-void rp_row_dot(const Rp22* row, int nb, const block_q8_K* const* y, float* res) {
+// IQ2_S: the 2 high index bits of each of 4 indices live in one qh byte (round 5's repacker, verified
+// against hi_spread.iq2s: (hq&3)<<8, (hq&0x0C)<<6, (hq&0x30)<<4, (hq&0xC0)<<2)
+struct F22 {
+    static constexpr int bytes = 82, groups = 8;
+    static constexpr float K = 0.125f;
+    static constexpr bool fold = false;          // two sub-block scales per 32 values: no folding
+    static void repack(const uint8_t* src, Rp22* dst) {
+        std::memcpy(dst->d, src, 2);
+        const uint8_t* qs = src + 2, * qh = src + 66;
+        for (int h = 0; h < 8; ++h) {
+            const int j = h >> 1, half = h & 1;
+            const uint8_t hq = qh[2 * j + half];
+            const uint8_t* q = qs + 8 * j + 4 * half;
+            dst->idx[4 * h + 0] = (uint16_t) (q[0] | ((hq & 0x03) << 8));
+            dst->idx[4 * h + 1] = (uint16_t) (q[1] | ((hq & 0x0C) << 6));
+            dst->idx[4 * h + 2] = (uint16_t) (q[2] | ((hq & 0x30) << 4));
+            dst->idx[4 * h + 3] = (uint16_t) (q[3] | ((hq & 0xC0) << 2));
+        }
+        std::memcpy(dst->sign,  src + 34, 32);
+        std::memcpy(dst->scale, src + 74, 8);
+    }
+    static inline void decode(const Rp22* b, int h, __m128i& g0, __m128i& g1,
+                              __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const uint16_t* ii = b->idx + 4 * h;
+        g0 = _mm_set_epi64x((long long) iq2s_grid[ii[1]], (long long) iq2s_grid[ii[0]]);
+        g1 = _mm_set_epi64x((long long) iq2s_grid[ii[3]], (long long) iq2s_grid[ii[2]]);
+        const uint8_t* sp = b->sign + 4 * h;
+        s0 = _mm_set_epi64x((long long) rp_sign8.v[sp[1]], (long long) rp_sign8.v[sp[0]]);
+        s1 = _mm_set_epi64x((long long) rp_sign8.v[sp[3]], (long long) rp_sign8.v[sp[2]]);
+        const uint8_t sb = b->scale[h];
+        c0 = _mm_load_si128((const __m128i*) rp_k16.v[sb & 15]);
+        c1 = _mm_load_si128((const __m128i*) rp_k16.v[sb >> 4]);
+    }
+};
+
+// IQ3_XXS: byte grid indices stay byte indices; the packed sign/scale word becomes bytes
+struct F18 {
+    static constexpr int bytes = 98, groups = 8;
+    static constexpr float K = 0.25f;
+    static constexpr bool fold = true;           // one sub-scale per 32 values (the shipped fold relies on it)
+    static void repack(const uint8_t* src, Rp18* dst) {
+        std::memcpy(dst->d, src, 2);
+        std::memcpy(dst->q, src + 2, 64);
+        for (int h = 0; h < 8; ++h) {
+            uint32_t w;
+            std::memcpy(&w, src + 66 + 4 * h, 4);
+            dst->sign[4 * h + 0] = (uint8_t) (w & 0x7Fu);
+            dst->sign[4 * h + 1] = (uint8_t) ((w >> 7) & 0x7Fu);
+            dst->sign[4 * h + 2] = (uint8_t) ((w >> 14) & 0x7Fu);
+            dst->sign[4 * h + 3] = (uint8_t) ((w >> 21) & 0x7Fu);
+            dst->scale[h] = (uint8_t) (w >> 28);
+        }
+    }
+    static inline void decode(const Rp18* b, int h, __m128i& g0, __m128i& g1,
+                              __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const uint8_t* q = b->q + 8 * h;
+        g0 = _mm_set_epi32((int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]],
+                           (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
+        g1 = _mm_set_epi32((int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]],
+                           (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]]);
+        const uint8_t* sp = b->sign + 4 * h;
+        s0 = _mm_set_epi64x((long long) rp_even_signs.v[sp[1]], (long long) rp_even_signs.v[sp[0]]);
+        s1 = _mm_set_epi64x((long long) rp_even_signs.v[sp[3]], (long long) rp_even_signs.v[sp[2]]);
+        c0 = c1 = _mm_load_si128((const __m128i*) rp_k16.v[b->scale[h]]);
+    }
+};
+
+// IQ3_S: 9-bit grid indices (qs byte + 1 bit from qh) merged to words, sign bytes stored unpacked,
+// the shared sub-scale split per half
+struct F21 {
+    static constexpr int bytes = 110, groups = 8;
+    static constexpr float K = 1.0f;
+    static constexpr bool fold = true;
+    static void repack(const uint8_t* src, Rp21* dst) {
+        std::memcpy(dst->d, src, 2);
+        const uint8_t* qs = src + 2, * qh = src + 66;
+        for (int h = 0; h < 8; ++h) {
+            const uint8_t hb = qh[2 * (h >> 1) + (h & 1)];
+            const uint8_t* q = qs + 8 * h;
+            for (int k = 0; k < 8; ++k)
+                dst->idx[8 * h + k] = (uint16_t) (q[k] | (((hb >> k) & 1u) << 8));
+        }
+        std::memcpy(dst->sign, src + 74, 32);   // four sign bytes per 32 values, the order sgn16 used
+        for (int h = 0; h < 8; ++h) {
+            const uint8_t s = src[106 + (h >> 1)];
+            dst->scale[h] = (uint8_t) ((h & 1) ? (s >> 4) : (s & 15));
+        }
+    }
+    static inline void decode(const Rp21* b, int h, __m128i& g0, __m128i& g1,
+                              __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const uint16_t* ii = b->idx + 8 * h;
+        g0 = _mm_set_epi32((int) iq3s_grid[ii[3]], (int) iq3s_grid[ii[2]],
+                           (int) iq3s_grid[ii[1]], (int) iq3s_grid[ii[0]]);
+        g1 = _mm_set_epi32((int) iq3s_grid[ii[7]], (int) iq3s_grid[ii[6]],
+                           (int) iq3s_grid[ii[5]], (int) iq3s_grid[ii[4]]);
+        const uint8_t* sp = b->sign + 4 * h;
+        s0 = _mm_set_epi64x((long long) rp_sign8.v[sp[1]], (long long) rp_sign8.v[sp[0]]);
+        s1 = _mm_set_epi64x((long long) rp_sign8.v[sp[3]], (long long) rp_sign8.v[sp[2]]);
+        c0 = c1 = _mm_load_si128((const __m128i*) rp_k16.v[b->scale[h]]);
+    }
+};
+
+// one repacked row: the mirror of iq_avx1.cpp's row_dot_r<TY, NT, 1> - same accumulators, same order, and
+// gate/up are separate calls exactly as gu_rows does them, so register pressure matches production
+template <int NT, class B, class F>
+void rp_row_dot(const B* row, int nb, const block_q8_K* const* y, float* res) {
     __m128 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm_setzero_ps();
     for (int i = 0; i < nb; ++i) {
         __m128i a0[NT], a1[NT];
         for (int t = 0; t < NT; ++t) a0[t] = a1[t] = _mm_setzero_si128();
-        const Rp22* blk = row + i;
-        for (int h = 0; h < 8; ++h) {
-            const uint16_t* ii = blk->idx + 4 * h;
-            const __m128i g0 = _mm_set_epi64x((long long) iq2s_grid[ii[1]], (long long) iq2s_grid[ii[0]]);
-            const __m128i g1 = _mm_set_epi64x((long long) iq2s_grid[ii[3]], (long long) iq2s_grid[ii[2]]);
-            const uint8_t* sp = blk->sign + 4 * h;
-            const __m128i s0 = _mm_set_epi64x((long long) rp_sign8.v[sp[1]], (long long) rp_sign8.v[sp[0]]);
-            const __m128i s1 = _mm_set_epi64x((long long) rp_sign8.v[sp[3]], (long long) rp_sign8.v[sp[2]]);
-            const uint8_t sb = blk->scale[h];
-            const __m128i c0 = _mm_load_si128((const __m128i*) rp_k16.v[sb & 15]);
-            const __m128i c1 = _mm_load_si128((const __m128i*) rp_k16.v[sb >> 4]);
+        const B* blk = row + i;
+        for (int h = 0; h < F::groups; ++h) {
+            __m128i g0, g1, s0, s1, c0, c1;
+            F::decode(blk, h, g0, g1, s0, s1, c0, c1);
             const int off = 32 * h;
             for (int t = 0; t < NT; ++t) {
                 const uint8_t* q8 = (const uint8_t*) y[t][i].qs + off;
-                a0[t] = _mm_add_epi32(a0[t], _mm_madd_epi16(_mm_maddubs_epi16(g0, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) q8), s0)), c0));
-                a1[t] = _mm_add_epi32(a1[t], _mm_madd_epi16(_mm_maddubs_epi16(g1, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + 16)), s1)), c1));
+                if constexpr (F::fold) {
+                    const __m128i d = _mm_add_epi16(_mm_maddubs_epi16(g0, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) q8), s0)),
+                                                    _mm_maddubs_epi16(g1, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + 16)), s1)));
+                    a0[t] = _mm_add_epi32(a0[t], _mm_madd_epi16(d, c0));
+                } else {
+                    a0[t] = _mm_add_epi32(a0[t], _mm_madd_epi16(_mm_maddubs_epi16(g0, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) q8), s0)), c0));
+                    a1[t] = _mm_add_epi32(a1[t], _mm_madd_epi16(_mm_maddubs_epi16(g1, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + 16)), s1)), c1));
+                }
             }
         }
         const uint16_t dh = (uint16_t) (blk->d[0] | (blk->d[1] << 8));
-        const float dx = h2f_local(dh) * 0.125f;
+        const float dx = h2f_local(dh) * F::K;
         for (int t = 0; t < NT; ++t) {
             const __m128 f = _mm_cvtepi32_ps(_mm_add_epi32(a0[t], a1[t]));
             accf[t] = _mm_add_ps(accf[t], _mm_mul_ps(_mm_set1_ps(dx * y[t][i].d), f));
@@ -283,48 +387,48 @@ void rp_row_dot(const Rp22* row, int nb, const block_q8_K* const* y, float* res)
     }
 }
 
-// gate/up rows of one expert, repacked layout, mirroring gu_rows (gate dot, up dot, then the SwiGLU)
-template <int NT>
-void rp_gu_rows(const Rp22* gate, const Rp22* up, int n, const void* const* act, float* const* ff, int nrow) {
+template <int NT, class B, class F>
+void rp_gu_rows(const B* gate, const B* up, int n, const void* const* act, float* const* ff, int nrow) {
     const block_q8_K* y[NT];
     const int nb = n / QK_K;
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     for (int r = 0; r < nrow; ++r) {
         float g[NT], u[NT];
-        rp_row_dot<NT>(gate + (size_t) r * nb, nb, y, g);
-        rp_row_dot<NT>(up + (size_t) r * nb, nb, y, u);
+        rp_row_dot<NT, B, F>(gate + (size_t) r * nb, nb, y, g);
+        rp_row_dot<NT, B, F>(up + (size_t) r * nb, nb, y, u);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
 
-// repack gate+up of nexp experts; returns gate/up pointers per expert
-struct RpBlobs { std::vector<Rp22> buf; size_t nbrow; };
-RpBlobs rp_build(const std::vector<uint8_t>& blob, size_t per, size_t gu_row, size_t up_off, int nexp, int nb, int nrow) {
-    RpBlobs rb; rb.nbrow = (size_t) nrow * nb;
-    rb.buf.resize((size_t) nexp * 2 * rb.nbrow);
-    for (int e = 0; e < nexp; ++e) {
-        const uint8_t* src = blob.data() + (size_t) e * per;
-        Rp22* g = rb.buf.data() + (size_t) e * 2 * rb.nbrow;
-        for (int r = 0; r < nrow; ++r)
-            for (int i = 0; i < nb; ++i) {
-                rp22_block(src + (size_t) r * gu_row + (size_t) i * 82, g + (size_t) r * nb + i);
-                rp22_block(src + up_off + (size_t) r * gu_row + (size_t) i * 82, g + rb.nbrow + (size_t) r * nb + i);
-            }
+template <class B, class F>
+void rp_gu_nt(int nt, const B* g, const B* u, int n, const void* const* act, float* const* ff, int nrow) {
+    switch (nt) {
+        case 1: rp_gu_rows<1, B, F>(g, u, n, act, ff, nrow); break;
+        case 2: rp_gu_rows<2, B, F>(g, u, n, act, ff, nrow); break;
+        case 3: rp_gu_rows<3, B, F>(g, u, n, act, ff, nrow); break;
+        case 4: rp_gu_rows<4, B, F>(g, u, n, act, ff, nrow); break;
+        case 5: rp_gu_rows<5, B, F>(g, u, n, act, ff, nrow); break;
+        case 6: rp_gu_rows<6, B, F>(g, u, n, act, ff, nrow); break;
+        case 7: rp_gu_rows<7, B, F>(g, u, n, act, ff, nrow); break;
+        default: rp_gu_rows<8, B, F>(g, u, n, act, ff, nrow); break;
     }
-    return rb;
 }
 
-void rp_gu_nt(int nt, const Rp22* g, const Rp22* u, int n, const void* const* act, float* const* ff, int nrow) {
-    switch (nt) {
-        case 1: rp_gu_rows<1>(g, u, n, act, ff, nrow); break;
-        case 2: rp_gu_rows<2>(g, u, n, act, ff, nrow); break;
-        case 3: rp_gu_rows<3>(g, u, n, act, ff, nrow); break;
-        case 4: rp_gu_rows<4>(g, u, n, act, ff, nrow); break;
-        case 5: rp_gu_rows<5>(g, u, n, act, ff, nrow); break;
-        case 6: rp_gu_rows<6>(g, u, n, act, ff, nrow); break;
-        case 7: rp_gu_rows<7>(g, u, n, act, ff, nrow); break;
-        default: rp_gu_rows<8>(g, u, n, act, ff, nrow); break;
+template <class B, class F>
+std::vector<B> rp_build(const std::vector<uint8_t>& blob, size_t per, size_t gu_row, size_t up_off,
+                        int nexp, int nb, int nrow) {
+    std::vector<B> out((size_t) nexp * 2 * nrow * nb);
+    for (int e = 0; e < nexp; ++e) {
+        const uint8_t* src = blob.data() + (size_t) e * per;
+        B* g = out.data() + (size_t) e * 2 * nrow * nb;
+        for (int r = 0; r < nrow; ++r)
+            for (int i = 0; i < nb; ++i) {
+                F::repack(src + (size_t) r * gu_row + (size_t) i * F::bytes, g + (size_t) r * nb + i);
+                F::repack(src + up_off + (size_t) r * gu_row + (size_t) i * F::bytes,
+                          g + (size_t) nrow * nb + (size_t) r * nb + i);
+            }
     }
+    return out;
 }
 
 // ---- the checks
@@ -343,17 +447,28 @@ void run_checks() {
         }
         // gate/up: nt = 1..8, every width bit-identical to that token's nt = 1 row (#152), all rel <= 1e-5 vs ggml
         std::vector<std::vector<float>> ff1(kMaxT), out1(kMaxT);
-        RpBlobs rb;   // PROTOTYPE: repacked gate/up for the IQ2_S rungs
-        if (c.gu == 22) rb = rp_build(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
+        // PROTOTYPE: repacked gate/up for the three formats whose decode builds grid indices or unpacks
+        // packed sign/scale fields (IQ2_S 20 layers, IQ3_XXS 17, IQ3_S 10; IQ4_XS is codebook-based, skip)
+        const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
+        std::vector<Rp22> rb22; std::vector<Rp18> rb18; std::vector<Rp21> rb21;
+        if (c.gu == 22) rb22 = rp_build<Rp22, F22>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
+        else if (c.gu == 18) rb18 = rp_build<Rp18, F18>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
+        else if (c.gu == 21) rb21 = rp_build<Rp21, F21>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
+        const bool rp_on = (c.gu == 22 || c.gu == 18 || c.gu == 21);
+        auto rp_run = [&](int nt, float* const* dst) {
+            if (c.gu == 22) rp_gu_nt<Rp22, F22>(nt, rb22.data(), rb22.data() + rphalf, kH, actp, dst, kFF);
+            else if (c.gu == 18) rp_gu_nt<Rp18, F18>(nt, rb18.data(), rb18.data() + rphalf, kH, actp, dst, kFF);
+            else rp_gu_nt<Rp21, F21>(nt, rb21.data(), rb21.data() + rphalf, kH, actp, dst, kFF);
+        };
         for (int nt = 1; nt <= kMaxT; ++nt) {
             cpu::iq128_gu_rows(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF);
-            if (c.gu == 22) {
-                // the bar for a repacked layout: bit for bit the rows the current kernel writes, no re-baseline
+            if (rp_on) {
+                // the bar for a layout change: bit for bit the rows the deployed kernel writes, no re-baseline
                 std::vector<std::vector<float>> ffr(kMaxT, std::vector<float>(kFF));
                 float* ffrp[kMaxT];
                 for (int t = 0; t < kMaxT; ++t) ffrp[t] = ffr[t].data();
-                rp_gu_nt(nt, rb.buf.data(), rb.buf.data() + rb.nbrow, kH, actp, ffrp, kFF);
-                // exact=true above: every row compared with memcmp, so 0 failures means the repacked kernel
+                rp_run(nt, ffrp);
+                // exact=true below: every row compared with memcmp, so 0 failures means the repacked kernel
                 // writes bit for bit what the deployed kernel writes. Say it once, where an operator reads it.
                 if (nt == kMaxT) std::printf("  %-16s gu repacked: bit-identical to the deployed kernel at nt=1..%d\n",
                                              c.name, kMaxT);
@@ -463,9 +578,18 @@ void run_bench(int mb, const std::vector<int>& nts) {
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             double ms_rp_gu = 0, ms_iq_gu_best = 0;
-            if (c.gu == 22) {   // PROTOTYPE: same weights, grid indices pre-merged (106-byte blocks).
+            const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
+            std::vector<Rp22> rb22; std::vector<Rp18> rb18; std::vector<Rp21> rb21;
+            if (c.gu == 22) rb22 = rp_build<Rp22, F22>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+            else if (c.gu == 18) rb18 = rp_build<Rp18, F18>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+            else if (c.gu == 21) rb21 = rp_build<Rp21, F21>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+            if (c.gu == 22 || c.gu == 18 || c.gu == 21) {   // PROTOTYPE: same weights, fields unpacked at pack time.
                 // Alternate the two variants and take the best of 3 - a single shot wanders by 2x at this size.
-                RpBlobs rb = rp_build(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+                auto rp_one = [&](int e) {
+                    if (c.gu == 22) { Rp22* g = rb22.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp22, F22>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
+                    else if (c.gu == 18) { Rp18* g = rb18.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp18, F18>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
+                    else { Rp21* g = rb21.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp21, F21>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
+                };
                 double best_iq = 1e30, best_rp = 1e30;
                 for (int rep = 0; rep < 3; ++rep) {
                     t0 = Clock::now();
@@ -473,10 +597,7 @@ void run_bench(int mb, const std::vector<int>& nts) {
                         cpu::iq128_gu_rows(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF);
                     best_iq = std::min(best_iq, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     t0 = Clock::now();
-                    for (int e = 0; e < nexp; ++e) {
-                        const Rp22* g = rb.buf.data() + (size_t) e * 2 * rb.nbrow;
-                        rp_gu_nt(nt, g, g + rb.nbrow, kH, actp, ffp, kFF);
-                    }
+                    for (int e = 0; e < nexp; ++e) rp_one(e);
                     best_rp = std::min(best_rp, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
                 ms_iq_gu_best = best_iq / nexp; ms_rp_gu = best_rp / nexp;
