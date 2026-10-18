@@ -431,6 +431,82 @@ std::vector<B> rp_build(const std::vector<uint8_t>& blob, size_t per, size_t gu_
     return out;
 }
 
+// Round 6 Q5: the same bytes, grouped per 32-value unit instead of per field, so the loop's three reads per
+// unit come from one window. Identical size (106 / 170 B) - the question is cache lines, not memory.
+// The unit header is unaligned by design; scalar uint16 loads handle that on Ivy Bridge.
+struct Rp22u {                                        // 106 bytes
+    uint8_t d[2];
+    struct { uint16_t idx[4]; uint8_t sign[4]; uint8_t scale; } __attribute__((packed)) u[8];
+};
+struct Rp21u {                                        // 170 bytes
+    uint8_t d[2];
+    struct { uint16_t idx[8]; uint8_t sign[4]; uint8_t scale; } __attribute__((packed)) u[8];
+};
+static_assert(sizeof(Rp22u) == 106 && sizeof(Rp21u) == 170, "unit-contiguous repacked sizes");
+
+struct F22u {
+    static constexpr int bytes = 82, groups = 8;
+    static constexpr float K = 0.125f;
+    static constexpr bool fold = false;
+    static void repack(const uint8_t* src, Rp22u* dst) {
+        std::memcpy(dst->d, src, 2);
+        const uint8_t* qs = src + 2, * qh = src + 66, * sg = src + 34;
+        for (int h = 0; h < 8; ++h) {
+            const int j = h >> 1, half = h & 1;
+            const uint8_t hq = qh[2 * j + half];
+            const uint8_t* q = qs + 8 * j + 4 * half;
+            dst->u[h].idx[0] = (uint16_t) (q[0] | ((hq & 0x03) << 8));
+            dst->u[h].idx[1] = (uint16_t) (q[1] | ((hq & 0x0C) << 6));
+            dst->u[h].idx[2] = (uint16_t) (q[2] | ((hq & 0x30) << 4));
+            dst->u[h].idx[3] = (uint16_t) (q[3] | ((hq & 0xC0) << 2));
+            for (int k = 0; k < 4; ++k) dst->u[h].sign[k] = sg[4 * h + k];
+            dst->u[h].scale = src[74 + h];
+        }
+    }
+    static inline void decode(const Rp22u* b, int h, __m128i& g0, __m128i& g1,
+                              __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const uint16_t* ii = b->u[h].idx;
+        g0 = _mm_set_epi64x((long long) iq2s_grid[ii[1]], (long long) iq2s_grid[ii[0]]);
+        g1 = _mm_set_epi64x((long long) iq2s_grid[ii[3]], (long long) iq2s_grid[ii[2]]);
+        const uint8_t* sp = b->u[h].sign;
+        s0 = _mm_set_epi64x((long long) rp_sign8.v[sp[1]], (long long) rp_sign8.v[sp[0]]);
+        s1 = _mm_set_epi64x((long long) rp_sign8.v[sp[3]], (long long) rp_sign8.v[sp[2]]);
+        const uint8_t sb = b->u[h].scale;
+        c0 = _mm_load_si128((const __m128i*) rp_k16.v[sb & 15]);
+        c1 = _mm_load_si128((const __m128i*) rp_k16.v[sb >> 4]);
+    }
+};
+
+struct F21u {
+    static constexpr int bytes = 110, groups = 8;
+    static constexpr float K = 1.0f;
+    static constexpr bool fold = true;
+    static void repack(const uint8_t* src, Rp21u* dst) {
+        std::memcpy(dst->d, src, 2);
+        const uint8_t* qs = src + 2, * qh = src + 66;
+        for (int h = 0; h < 8; ++h) {
+            const uint8_t hb = qh[2 * (h >> 1) + (h & 1)];
+            const uint8_t* q = qs + 8 * h;
+            for (int k = 0; k < 8; ++k) dst->u[h].idx[k] = (uint16_t) (q[k] | (((hb >> k) & 1u) << 8));
+            for (int k = 0; k < 4; ++k) dst->u[h].sign[k] = src[74 + 4 * h + k];
+            const uint8_t s = src[106 + (h >> 1)];
+            dst->u[h].scale = (uint8_t) ((h & 1) ? (s >> 4) : (s & 15));
+        }
+    }
+    static inline void decode(const Rp21u* b, int h, __m128i& g0, __m128i& g1,
+                              __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const uint16_t* ii = b->u[h].idx;
+        g0 = _mm_set_epi32((int) iq3s_grid[ii[3]], (int) iq3s_grid[ii[2]],
+                           (int) iq3s_grid[ii[1]], (int) iq3s_grid[ii[0]]);
+        g1 = _mm_set_epi32((int) iq3s_grid[ii[7]], (int) iq3s_grid[ii[6]],
+                           (int) iq3s_grid[ii[5]], (int) iq3s_grid[ii[4]]);
+        const uint8_t* sp = b->u[h].sign;
+        s0 = _mm_set_epi64x((long long) rp_sign8.v[sp[1]], (long long) rp_sign8.v[sp[0]]);
+        s1 = _mm_set_epi64x((long long) rp_sign8.v[sp[3]], (long long) rp_sign8.v[sp[2]]);
+        c0 = c1 = _mm_load_si128((const __m128i*) rp_k16.v[b->u[h].scale]);
+    }
+};
+
 // ---- the checks
 void run_checks() {
     for (const Case& c : kCases) {
@@ -455,6 +531,14 @@ void run_checks() {
         else if (c.gu == 18) rb18 = rp_build<Rp18, F18>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
         else if (c.gu == 21) rb21 = rp_build<Rp21, F21>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
         const bool rp_on = (c.gu == 22 || c.gu == 18 || c.gu == 21);
+        std::vector<Rp22u> rb22u; std::vector<Rp21u> rb21u;
+        if (c.gu == 22) rb22u = rp_build<Rp22u, F22u>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
+        else if (c.gu == 21) rb21u = rp_build<Rp21u, F21u>(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
+        const bool rpu_on = (c.gu == 22 || c.gu == 21);
+        auto rp_run_unit = [&](int nt, float* const* dst) {
+            if (c.gu == 22) rp_gu_nt<Rp22u, F22u>(nt, rb22u.data(), rb22u.data() + rphalf, kH, actp, dst, kFF);
+            else rp_gu_nt<Rp21u, F21u>(nt, rb21u.data(), rb21u.data() + rphalf, kH, actp, dst, kFF);
+        };
         auto rp_run = [&](int nt, float* const* dst) {
             if (c.gu == 22) rp_gu_nt<Rp22, F22>(nt, rb22.data(), rb22.data() + rphalf, kH, actp, dst, kFF);
             else if (c.gu == 18) rp_gu_nt<Rp18, F18>(nt, rb18.data(), rb18.data() + rphalf, kH, actp, dst, kFF);
@@ -464,18 +548,24 @@ void run_checks() {
             cpu::iq128_gu_rows(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF);
             if (rp_on) {
                 // the bar for a layout change: bit for bit the rows the deployed kernel writes, no re-baseline
-                std::vector<std::vector<float>> ffr(kMaxT, std::vector<float>(kFF));
+                std::vector<std::vector<float>> ffr(kMaxT, std::vector<float>(kFF)), ffru(kMaxT, std::vector<float>(kFF));
                 float* ffrp[kMaxT];
-                for (int t = 0; t < kMaxT; ++t) ffrp[t] = ffr[t].data();
+                float* ffrpu[kMaxT];
+                for (int t = 0; t < kMaxT; ++t) { ffrp[t] = ffr[t].data(); ffrpu[t] = ffru[t].data(); }
                 rp_run(nt, ffrp);
+                if (rpu_on) rp_run_unit(nt, ffrpu);
                 // exact=true below: every row compared with memcmp, so 0 failures means the repacked kernel
                 // writes bit for bit what the deployed kernel writes. Say it once, where an operator reads it.
-                if (nt == kMaxT) std::printf("  %-16s gu repacked: bit-identical to the deployed kernel at nt=1..%d\n",
-                                             c.name, kMaxT);
+                if (nt == kMaxT) std::printf("  %-16s gu repacked: bit-identical to the deployed kernel at nt=1..%d%s\n",
+                                             c.name, kMaxT, rpu_on ? " (both layouts)" : "");
                 for (int t = 0; t < nt; ++t) {
                     char what[96];
                     std::snprintf(what, sizeof what, "%s gu rp vs current nt=%d token %d", c.name, nt, t);
                     check(what, ffr[t], ff[t], true);
+                    if (rpu_on) {
+                        std::snprintf(what, sizeof what, "%s gu rp-unit vs current nt=%d token %d", c.name, nt, t);
+                        check(what, ffru[t], ff[t], true);
+                    }
                 }
             }
             for (int t = 0; t < nt; ++t) {
@@ -577,12 +667,15 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-            double ms_rp_gu = 0, ms_iq_gu_best = 0;
+            double ms_rp_gu = 0, ms_iq_gu_best = 0, ms_rpu_gu = 0;
             const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
             std::vector<Rp22> rb22; std::vector<Rp18> rb18; std::vector<Rp21> rb21;
+            std::vector<Rp22u> rb22u; std::vector<Rp21u> rb21u;
             if (c.gu == 22) rb22 = rp_build<Rp22, F22>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
             else if (c.gu == 18) rb18 = rp_build<Rp18, F18>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
             else if (c.gu == 21) rb21 = rp_build<Rp21, F21>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+            if (c.gu == 22) rb22u = rp_build<Rp22u, F22u>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+            else if (c.gu == 21) rb21u = rp_build<Rp21u, F21u>(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
             if (c.gu == 22 || c.gu == 18 || c.gu == 21) {   // PROTOTYPE: same weights, fields unpacked at pack time.
                 // Alternate the two variants and take the best of 3 - a single shot wanders by 2x at this size.
                 auto rp_one = [&](int e) {
@@ -590,7 +683,11 @@ void run_bench(int mb, const std::vector<int>& nts) {
                     else if (c.gu == 18) { Rp18* g = rb18.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp18, F18>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
                     else { Rp21* g = rb21.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp21, F21>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
                 };
-                double best_iq = 1e30, best_rp = 1e30;
+                auto rpu_one = [&](int e) {
+                    if (c.gu == 22) { Rp22u* g = rb22u.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp22u, F22u>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
+                    else { Rp21u* g = rb21u.data() + (size_t) e * 2 * rphalf; rp_gu_nt<Rp21u, F21u>(nt, g, g + rphalf, kH, actp, ffp, kFF); }
+                };
+                double best_iq = 1e30, best_rp = 1e30, best_rpu = 1e30;
                 for (int rep = 0; rep < 3; ++rep) {
                     t0 = Clock::now();
                     for (int e = 0; e < nexp; ++e)
@@ -599,8 +696,14 @@ void run_bench(int mb, const std::vector<int>& nts) {
                     t0 = Clock::now();
                     for (int e = 0; e < nexp; ++e) rp_one(e);
                     best_rp = std::min(best_rp, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    if (c.gu == 22 || c.gu == 21) {
+                        t0 = Clock::now();
+                        for (int e = 0; e < nexp; ++e) rpu_one(e);
+                        best_rpu = std::min(best_rpu, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    }
                 }
                 ms_iq_gu_best = best_iq / nexp; ms_rp_gu = best_rp / nexp;
+                if (c.gu == 22 || c.gu == 21) ms_rpu_gu = best_rpu / nexp;   // 18 has no unit layout: 1e30 would print
             }
             std::printf("  %-16s nt=%d  ggml %8.2f ms/expert   iq128 %6.2f ms/expert   %.1fx   [gu %.2f vs %.2f = %.2fx  dn %.2f vs %.2f = %.2fx]\n",
                         c.name, nt, ms_ggml / nexp, ms_iq / nexp, ms_ggml / ms_iq,
@@ -609,6 +712,9 @@ void run_bench(int mb, const std::vector<int>& nts) {
             if (ms_rp_gu > 0)
                 std::printf("  %-16s nt=%d  gu  current %.3f  vs  REPACKED %.3f ms/expert  = %.3fx (best of 3, alternating)\n",
                             c.name, nt, ms_iq_gu_best, ms_rp_gu, ms_iq_gu_best / ms_rp_gu);
+            if (ms_rpu_gu > 0)
+                std::printf("  %-16s nt=%d  gu  REPACKED %.3f  vs  REPACKED-UNIT %.3f ms/expert  = %.3fx  (vs current %.3fx)\n",
+                            c.name, nt, ms_rp_gu, ms_rpu_gu, ms_rp_gu / ms_rpu_gu, ms_iq_gu_best / ms_rpu_gu);
         }
     }
 }
