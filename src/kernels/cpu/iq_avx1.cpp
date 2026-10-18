@@ -306,7 +306,7 @@ inline __m128i madd_add_fold(__m128i acc, __m128i g0, __m128i g1, __m128i sgn0, 
 // madd) are ~20 cycles of pure latency and at NT=1 there is nothing to overlap, so the kernel runs latency-
 // bound at ~1/4 of its issue rate.  Two rows interleave independent chains in the same registers and roughly
 // double the throughput; the per-row integer sums and the float stage are unchanged, bit for bit.
-template <int TY, int NT, int R>
+template <int TY, int NT, int R, bool HOIST>
 inline void row_dot_r(const uint8_t* const* rows, int nblocks, const block_q8_K* const* y, float* res) {
     const int pf = prefetch_distance();
     __m128 accf[R][NT];
@@ -325,6 +325,15 @@ inline void row_dot_r(const uint8_t* const* rows, int nblocks, const block_q8_K*
                     Fmt128<TY>::decode(blk, j, half, g0[rr], g1[rr], s0[rr], s1[rr], c0[rr], c1[rr]);
                 }
                 const int off = 64 * j + 32 * half;
+                // At one token the activation bytes are the same for every row in the pair and for both
+                // projections, so load them once per unit instead of once per row.  Only for NT == 1: with more
+                // tokens the hoisted vectors themselves (2 per token) push the 16 XMM registers over and spill.
+                __m128i yv[NT][2];
+                if constexpr (HOIST) {
+                    const uint8_t* q8 = (const uint8_t*) (y[0][i].qs + off);
+                    yv[0][0] = _mm_loadu_si128((const __m128i*) q8);
+                    yv[0][1] = _mm_loadu_si128((const __m128i*) (q8 + 16));
+                }
                 // c0 == c1 in IQ3_XXS and IQ3_S (one 4-bit scale per 32 values): fold the halves, one pmaddwd
                 // instead of two.  IQ2_S (two scales) and IQ4_XS (grid up to 127, would saturate) stay on the
                 // two-accumulator path - and the fold needs both halves' decode, so it is per row, not shared.
@@ -332,9 +341,14 @@ inline void row_dot_r(const uint8_t* const* rows, int nblocks, const block_q8_K*
                     for (int rr = 0; rr < R; ++rr) {
                         for (int t = 0; t < NT; ++t) {
                             const uint8_t* q8 = (const uint8_t*) (y[t][i].qs + off);
-                            acci[rr][t][0] = madd_add_fold(acci[rr][t][0], g0[rr], g1[rr], s0[rr], s1[rr],
-                                                           _mm_loadu_si128((const __m128i*) q8),
-                                                           _mm_loadu_si128((const __m128i*) (q8 + 16)), c0[rr]);
+                            if constexpr (HOIST) {
+                                acci[rr][t][0] = madd_add_fold(acci[rr][t][0], g0[rr], g1[rr], s0[rr], s1[rr],
+                                                               yv[0][0], yv[0][1], c0[rr]);
+                            } else {
+                                acci[rr][t][0] = madd_add_fold(acci[rr][t][0], g0[rr], g1[rr], s0[rr], s1[rr],
+                                                               _mm_loadu_si128((const __m128i*) q8),
+                                                               _mm_loadu_si128((const __m128i*) (q8 + 16)), c0[rr]);
+                            }
                         }
                     }
                     continue;
@@ -342,8 +356,13 @@ inline void row_dot_r(const uint8_t* const* rows, int nblocks, const block_q8_K*
                 for (int rr = 0; rr < R; ++rr) {
                     for (int t = 0; t < NT; ++t) {
                         const uint8_t* q8 = (const uint8_t*) (y[t][i].qs + off);
-                        acci[rr][t][0] = madd_add(acci[rr][t][0], g0[rr], s0[rr], _mm_loadu_si128((const __m128i*) q8), c0[rr]);
-                        acci[rr][t][1] = madd_add(acci[rr][t][1], g1[rr], s1[rr], _mm_loadu_si128((const __m128i*) (q8 + 16)), c1[rr]);
+                        if constexpr (HOIST) {
+                            acci[rr][t][0] = madd_add(acci[rr][t][0], g0[rr], s0[rr], yv[0][0], c0[rr]);
+                            acci[rr][t][1] = madd_add(acci[rr][t][1], g1[rr], s1[rr], yv[0][1], c1[rr]);
+                        } else {
+                            acci[rr][t][0] = madd_add(acci[rr][t][0], g0[rr], s0[rr], _mm_loadu_si128((const __m128i*) q8), c0[rr]);
+                            acci[rr][t][1] = madd_add(acci[rr][t][1], g1[rr], s1[rr], _mm_loadu_si128((const __m128i*) (q8 + 16)), c1[rr]);
+                        }
                     }
                 }
             }
@@ -366,10 +385,10 @@ inline void row_dot_r(const uint8_t* const* rows, int nblocks, const block_q8_K*
 template <int TY, int NT>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     const uint8_t* rows[1] = {row};   // R=1 form: one row, same code, same bits
-    row_dot_r<TY, NT, 1>(rows, nblocks, y, res);
+    row_dot_r<TY, NT, 1, false>(rows, nblocks, y, res);
 }
 
-template <int TY, int NT>
+template <int TY, int NT, int MODE>
 inline void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                     float* const* ff, int r0, int r1) {
     const block_q8_K* y[NT];
@@ -380,18 +399,18 @@ inline void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, co
     // already fill the issue window and a second row pair only adds register pressure (measured neutral).
     // (A four-row fused gate+up pass was measured: it spills on 16 XMM registers and loses 10-20%.)
     int r = r0;
-    if (NT == 1) {
-        float g2[2 * NT], u2[2 * NT];
-        for (; r + 1 < r1; r += 2) {
-            const uint8_t* rows[2] = {blob + (size_t) r * gu_row, blob + (size_t) (r + 1) * gu_row};
-            row_dot_r<TY, NT, 2>(rows, nb, y, g2);
-            const uint8_t* urows[2] = {blob + up_off + (size_t) r * gu_row, blob + up_off + (size_t) (r + 1) * gu_row};
-            row_dot_r<TY, NT, 2>(urows, nb, y, u2);
+    constexpr bool hoist = (MODE != 0 && NT == 1);
+    if (NT == 1 && MODE == 1) {
+        float g2[2 * NT];
+        // Pair ONE gate row with ONE up row (two independent chains, the second row's pointers are the same
+        // stride), instead of two gate rows then two up rows: the two projections share the activation bytes,
+        // so the hoisted loads above serve both, and one call replaces two.
+        for (; r < r1; ++r) {
+            const uint8_t* rows[2] = {blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row};
+            row_dot_r<TY, NT, 2, hoist>(rows, nb, y, g2);   // g2[0] = gate, g2[1] = up
             for (int t = 0; t < NT; ++t) {
-                const float gr = g2[0 * NT + t], ur = u2[0 * NT + t];
-                ff[t][r] = (gr / (1.f + std::exp(-gr))) * ur;
-                const float gr1 = g2[1 * NT + t], ur1 = u2[1 * NT + t];
-                ff[t][r + 1] = (gr1 / (1.f + std::exp(-gr1))) * ur1;
+                const float gr = g2[0 * NT + t];
+                ff[t][r] = (gr / (1.f + std::exp(-gr))) * g2[1 * NT + t];
             }
         }
     }
@@ -402,18 +421,37 @@ inline void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, co
     }
 }
 
+template <int TY> void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+               const void* const* act, float* const* ff, int r0, int r1);
+
+// MODE at one token: 0 = two gate rows then two up rows, no hoist (the path shipped until now),
+// 1 = one gate row paired with one up row, activation loads hoisted (the candidate), 2 = the old pairing
+// with the loads hoisted.  shortcut: kept only while the A/B decides between them; delete the losers.
+template <int TY>
+void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                     float* const* ff, int r0, int r1, int mode) {
+    if (nt == 1) {
+        switch (mode) {
+            case 0: gu_rows<TY, 1, 0>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 2: gu_rows<TY, 1, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            default: gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+        }
+    }
+    gu_rows_nt<TY>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+}
+
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows<TY, 2, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows<TY, 3, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows<TY, 4, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows<TY, 5, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows<TY, 6, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows<TY, 7, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: gu_rows<TY, 8, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
     }
 }
 
@@ -634,12 +672,26 @@ bool iq128_down_supported(int type) noexcept {
 
 void iq128_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1) {
+    // The one-token pairing of one gate row with one up row is measured per format (iq_avx1_parity, min of 4
+    // alternating, 7 samples): IQ3_S +4.9% (7/7 samples), IQ2_S +2.6% (6/7), IQ3_XXS flat, IQ4_XS -23%.  So the
+    // mode is chosen per type, not globally, and every mode writes bit for bit the same rows.
     switch (type) {
-        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
+        case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 1); break;
+        case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 1); break;
+        case 23: gu_rows_nt_mode<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
         default: break;
+    }
+}
+
+void iq128_gu_rows_mode(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                        int nt, float* const* ff, int r0, int r1, int mode) {
+    switch (type) {
+        case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, mode); break;
+        case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, mode); break;
+        case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, mode); break;
+        case 23: gu_rows_nt_mode<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, mode); break;
+        default: std::abort();
     }
 }
 
