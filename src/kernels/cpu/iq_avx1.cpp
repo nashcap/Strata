@@ -125,6 +125,19 @@ static constexpr Sign8 sign8{};
 static_assert(sign8.v[0] == 0x0101010101010101ull && sign8.v[1] == 0x01010101010101FFull,
               "sign8: byte k = 0xFF when bit k of i is set");
 
+// The sub-block scale (2k+1, k = 0..15) pre-broadcast over the 8 int16 lanes: one aligned 128-bit load on the
+// load ports instead of vmovd + vpshufd + two vpshufb.  vpshufb is port 1 only on Ivy Bridge and port 1
+// measures 61 % busy in this loop, ports 2/3 (loads) 36 %.  16 entries x 16 B = 256 B, 4 cache lines.
+struct KScale16 {
+    alignas(16) int16_t v[16][8];
+    constexpr KScale16() : v{} {
+        for (int k = 0; k < 16; ++k)
+            for (int l = 0; l < 8; ++l) v[k][l] = (int16_t) (2 * k + 1);
+    }
+};
+static constexpr KScale16 kscale16{};
+static_assert(kscale16.v[0][0] == 1 && kscale16.v[15][7] == 31, "kscale16[k] == _mm_set1_epi16(2k+1)");
+
 // The high index bits of a 32-value half spread one per byte (iq_avx2.cpp's HiSpread): punpcklbw puts them
 // next to the low index bytes, so every grid index is a 16-bit load.  IQ3_S: byte k = bit k (the 9th bit of
 // index k).  IQ2_S: byte k = bits 2k,2k+1 (bits 8-9 of index k), k < 4.
@@ -190,7 +203,7 @@ template <> struct Fmt128<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x
         const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
         s0 = _mm_set_epi64x((long long) even_signs.v[(w >> 7) & 127], (long long) even_signs.v[w & 127]);
         s1 = _mm_set_epi64x((long long) even_signs.v[(w >> 21) & 127], (long long) even_signs.v[(w >> 14) & 127]);
-        c0 = c1 = _mm_set1_epi16((short) (2 * (int) (w >> 28) + 1));
+        c0 = c1 = _mm_load_si128((const __m128i*) kscale16.v[w >> 28]);
     }
 };
 
@@ -209,7 +222,7 @@ template <> struct Fmt128<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[
         s0 = sgn16(sg, 0);
         s1 = sgn16(sg, 1);
         const uint8_t s = b[106 + j];
-        c0 = c1 = _mm_set1_epi16((short) (2 * (int) (half ? s >> 4 : s & 15) + 1));
+        c0 = c1 = _mm_load_si128((const __m128i*) kscale16.v[half ? s >> 4 : s & 15]);
     }
 };
 
@@ -228,8 +241,8 @@ template <> struct Fmt128<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign by
         s0 = _mm_set_epi64x((long long) sign8.v[sp[1]], (long long) sign8.v[sp[0]]);
         s1 = _mm_set_epi64x((long long) sign8.v[sp[3]], (long long) sign8.v[sp[2]]);
         const uint8_t sb = b[74 + 2 * j + half];
-        c0 = _mm_set1_epi16((short) (2 * (sb & 15) + 1));
-        c1 = _mm_set1_epi16((short) (2 * (sb >> 4) + 1));
+        c0 = _mm_load_si128((const __m128i*) kscale16.v[sb & 15]);
+        c1 = _mm_load_si128((const __m128i*) kscale16.v[sb >> 4]);
     }
 };
 
