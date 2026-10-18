@@ -400,6 +400,21 @@ inline void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, co
     // (A four-row fused gate+up pass was measured: it spills on 16 XMM registers and loses 10-20%.)
     int r = r0;
     constexpr bool hoist = (MODE != 0 && NT == 1);
+    if (NT == 1 && MODE == 3) {
+        // four chains: two rows' gate and up in one pass (R = 4). 8 decoded vectors + 8 accumulators against
+        // 16 XMM registers, so this measures what the spills really cost at one token.
+        float g4[4 * NT];
+        for (; r + 1 < r1; r += 2) {
+            const uint8_t* rows[4] = {blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row,
+                                      blob + (size_t) (r + 1) * gu_row, blob + up_off + (size_t) (r + 1) * gu_row};
+            row_dot_r<TY, NT, 4, true>(rows, nb, y, g4);
+            for (int t = 0; t < NT; ++t) {
+                const float g0 = g4[0 * NT + t], g1 = g4[2 * NT + t];
+                ff[t][r] = (g0 / (1.f + std::exp(-g0))) * g4[1 * NT + t];
+                ff[t][r + 1] = (g1 / (1.f + std::exp(-g1))) * g4[3 * NT + t];
+            }
+        }
+    }
     if (NT == 1 && MODE == 1) {
         float g2[2 * NT];
         // Pair ONE gate row with ONE up row (two independent chains, the second row's pointers are the same
@@ -434,6 +449,7 @@ void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, 
         switch (mode) {
             case 0: gu_rows<TY, 1, 0>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 2: gu_rows<TY, 1, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 3: gu_rows<TY, 1, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             default: gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
         }
     }
