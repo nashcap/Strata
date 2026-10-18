@@ -436,6 +436,62 @@ inline void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, co
     }
 }
 
+
+// MODE 4 (measurement): IQ2_S at one token, the 32-value unit decoded in two 16-value phases so fewer vectors
+// are live at once - 3 per row per phase (g, s, c) instead of 6 - which is what round 7 claims lets R = 2 run
+// with no spills. The index build stays once per 32 values (their sample decoded each half independently and
+// paid for grid_idx twice). Same products, same accumulators, so the bits cannot move.
+static inline void iq2s_dec16(__m128i idx, const uint8_t* sp, uint8_t sb, int which,
+                              __m128i& g, __m128i& s, __m128i& c) {
+    g = _mm_set_epi64x((long long) iq2s_grid[_mm_extract_epi16(idx, 2 * which + 1)],
+                       (long long) iq2s_grid[_mm_extract_epi16(idx, 2 * which)]);
+    s = _mm_set_epi64x((long long) sign8.v[sp[2 * which + 1]], (long long) sign8.v[sp[2 * which]]);
+    c = _mm_load_si128((const __m128i*) kscale16.v[which ? (sb >> 4) : (sb & 15)]);
+}
+
+template <int TY>
+inline void gu_rows_phased(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                           float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag0 = _mm_setzero_si128(), ag1 = _mm_setzero_si128();
+            __m128i au0 = _mm_setzero_si128(), au1 = _mm_setzero_si128();
+            for (int j = 0; j < 4; ++j) {
+                for (int half = 0; half < 2; ++half) {
+                    const int off = 64 * j + 32 * half;
+                    const __m128i ig = grid_idx(gb + 2 + 8 * j + 4 * half, hi_spread.iq2s[gb[66 + 2 * j + half]]);
+                    const __m128i iu = grid_idx(ub + 2 + 8 * j + 4 * half, hi_spread.iq2s[ub[66 + 2 * j + half]]);
+                    const uint8_t* spg = gb + 2 + 32 + 8 * j + 4 * half;
+                    const uint8_t* spu = ub + 2 + 32 + 8 * j + 4 * half;
+                    const uint8_t sbg = gb[74 + 2 * j + half], sbu = ub[74 + 2 * j + half];
+                    const __m128i yv0 = _mm_loadu_si128((const __m128i*) (q8 + off));
+                    __m128i g, s, c;
+                    iq2s_dec16(ig, spg, sbg, 0, g, s, c); ag0 = madd_add(ag0, g, s, yv0, c);
+                    iq2s_dec16(iu, spu, sbu, 0, g, s, c); au0 = madd_add(au0, g, s, yv0, c);
+                    const __m128i yv1 = _mm_loadu_si128((const __m128i*) (q8 + off + 16));
+                    iq2s_dec16(ig, spg, sbg, 1, g, s, c); ag1 = madd_add(ag1, g, s, yv1, c);
+                    iq2s_dec16(iu, spu, sbu, 1, g, s, c); au1 = madd_add(au1, g, s, yv1, c);
+                }
+            }
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(ag0, ag1))));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(au0, au1))));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
 template <int TY> void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                const void* const* act, float* const* ff, int r0, int r1);
 
@@ -450,6 +506,7 @@ void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, 
             case 0: gu_rows<TY, 1, 0>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 2: gu_rows<TY, 1, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 3: gu_rows<TY, 1, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 4: gu_rows_phased<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             default: gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
         }
     }
@@ -694,7 +751,7 @@ void iq128_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
     switch (type) {
         case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
         case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 1); break;
-        case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 1); break;
+        case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 4); break;   // phased 16-value decode
         case 23: gu_rows_nt_mode<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
         default: break;
     }

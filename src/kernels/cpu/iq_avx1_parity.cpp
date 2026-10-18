@@ -573,7 +573,8 @@ void run_checks() {
                 std::vector<std::vector<float>> ffm(kMaxT, std::vector<float>(kFF));
                 float* ffmp[kMaxT];
                 for (int t = 0; t < kMaxT; ++t) ffmp[t] = ffm[t].data();
-                for (int mode : {0, 2, 3}) {
+                for (int mode : {0, 2, 3, 4}) {
+                    if (mode == 4 && c.gu != 22) continue;   // the phased shape reads IQ2_S's block layout
                     cpu::iq128_gu_rows_mode(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffmp, 0, kFF, mode);
                     char what[96];
                     std::snprintf(what, sizeof what, "%s gu pairing mode=%d nt=1", c.name, mode);
@@ -680,17 +681,19 @@ void run_bench(int mb, const std::vector<int>& nts) {
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {   // row pairing / hoist A/B
-                double b[4] = {1e30, 1e30, 1e30, 1e30};
-                for (int rep = 0; rep < 4; ++rep)
-                    for (int mode = 0; mode < 4; ++mode) {
+                double b[5] = {1e30, 1e30, 1e30, 1e30, 1e30};
+                for (int rep = 0; rep < 5; ++rep)
+                    for (int mode = 0; mode < 5; ++mode) {
+                        if (mode >= 4 && c.gu != 22) continue;   // the phased shape is IQ2_S only
                         t0 = Clock::now();
                         for (int e = 0; e < nexp; ++e)
                             cpu::iq128_gu_rows_mode(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off,
                                                     kH, actp, nt, ffp, 0, kFF, mode);
                         b[mode] = std::min(b[mode], std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     }
-                std::printf("  %-16s nt=1  pairing old %.3f | pair+hoist %.3f (%.3fx) | hoist %.3f (%.3fx) | R=4 %.3f (%.3fx) ms/expert, min of 4 alternating\n",
-                            c.name, b[0] / nexp, b[1] / nexp, b[0] / b[1], b[2] / nexp, b[0] / b[2], b[3] / nexp, b[0] / b[3]);
+                std::printf("  %-16s nt=1  pairing old %.3f | pair+hoist %.3f (%.3fx) | hoist %.3f (%.3fx) | R=4 %.3f (%.3fx) | phased16 %.3f (%.3fx vs old, %.3fx vs shipped) min of 5 alternating\n",
+                            c.name, b[0] / nexp, b[1] / nexp, b[0] / b[1], b[2] / nexp, b[0] / b[2], b[3] / nexp, b[0] / b[3],
+                            b[4] / nexp, b[0] / b[4], b[1] / b[4]);
             }
             double ms_rp_gu = 0, ms_iq_gu_best = 0, ms_rpu_gu = 0;
             const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
