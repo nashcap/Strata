@@ -179,6 +179,154 @@ void check(const char* what, const std::vector<float>& got, const std::vector<fl
     if (!(r <= 1e-5)) { std::printf("  FAIL %s: rel %.3e > 1e-5 vs ggml-cpu\n", what, r); ++failures; }
 }
 
+// ---- PROTOTYPE (benchmark only, not the engine): IQ2_S with the 10-bit grid indices pre-merged into
+// 16-bit words, so the decode no longer builds them from qs bytes + packed qh bits.
+// If this wins at nt=1 the real version is an offline repack in the pack (tools/iq_pack.py) plus a second
+// gate/up blob pointer in NativeFmt - NOT a runtime repack cache. The GPU tier keeps reading the GGUF.
+// shortcut: duplicates the float stage of iq_avx1.cpp's row_dot_r; delete it once the engine has a repacked rung.
+#include <immintrin.h>
+
+struct Rp22 {                                    // one repacked ggml block (256 values), 106 bytes
+    uint8_t  d[2];                               // 2
+    uint16_t idx[32];                            // 64: 8 groups x 4 grid indices (qs bits | 2 qh bits)
+    uint8_t  sign[32];                           // 32
+    uint8_t  scale[8];                           // 8
+};
+static_assert(sizeof(Rp22) == 106, "repacked IQ2_S block must be 106 bytes");
+
+struct RpSign8 { uint64_t v[256]; RpSign8() : v() {
+    for (unsigned i = 0; i < 256; ++i) { uint64_t w = 0;
+        for (int k = 0; k < 8; ++k) w |= (uint64_t) (((i >> k) & 1u) ? 0xFFu : 1u) << (8 * k);
+        v[i] = w; } } };
+struct RpK16 { alignas(16) int16_t v[16][16]; RpK16() : v() {
+    for (int k = 0; k < 16; ++k) for (int l = 0; l < 16; ++l) v[k][l] = (int16_t) (2 * k + 1); } };
+static const RpSign8 rp_sign8{};
+static const RpK16 rp_k16{};
+
+void rp22_block(const uint8_t* src, Rp22* dst) {
+    std::memcpy(dst->d, src, 2);
+    const uint8_t* qs = src + 2;                       // 32 grid index bytes
+    const uint8_t* qh = src + 66;                      // 8 bytes, 2 high bits per index
+    for (int h = 0; h < 8; ++h) {
+        const int j = h >> 1, half = h & 1;
+        const uint8_t hq = qh[2 * j + half];
+        const uint8_t* q = qs + 8 * j + 4 * half;
+        dst->idx[4 * h + 0] = (uint16_t) (q[0] | ((hq & 0x03) << 8));
+        dst->idx[4 * h + 1] = (uint16_t) (q[1] | ((hq & 0x0C) << 6));
+        dst->idx[4 * h + 2] = (uint16_t) (q[2] | ((hq & 0x30) << 4));
+        dst->idx[4 * h + 3] = (uint16_t) (q[3] | ((hq & 0xC0) << 2));
+    }
+    std::memcpy(dst->sign,  src + 34, 32);
+    std::memcpy(dst->scale, src + 74, 8);
+}
+
+// fp16 -> fp32, the same bits as iq_avx1.cpp's h2f (fp16 -> fp32 is exact, so any correct conversion matches)
+float h2f_local(uint16_t h) {
+    const uint32_t e = h & 0x7C00u;
+    if (e && e != 0x7C00u) {
+        const uint32_t f = ((uint32_t) (h & 0x7FFFu) << 13) + 0x38000000u | (uint32_t) (h & 0x8000u) << 16;
+        float out; std::memcpy(&out, &f, 4); return out;
+    }
+    const uint32_t sign = (uint32_t) (h >> 15) & 1u;
+    uint32_t exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
+    if (exp == 0) {
+        if (man == 0) { f = sign << 31; }
+        else {
+            exp = 127 - 15 + 1;
+            while (!(man & 0x400u)) { man <<= 1; --exp; }
+            man &= 0x3FFu;
+            f = (sign << 31) | (exp << 23) | (man << 13);
+        }
+    } else if (exp == 31) { f = (sign << 31) | 0x7F800000u | (man << 13); }
+    else { f = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13); }
+    float out; std::memcpy(&out, &f, 4); return out;
+}
+
+// one repacked row, the mirror of iq_avx1.cpp's row_dot_r<22, NT, 1> (same accumulators, same order):
+// gate and up are separate calls here exactly as gu_rows does them, so register pressure matches production
+template <int NT>
+void rp_row_dot(const Rp22* row, int nb, const block_q8_K* const* y, float* res) {
+    __m128 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        __m128i a0[NT], a1[NT];
+        for (int t = 0; t < NT; ++t) a0[t] = a1[t] = _mm_setzero_si128();
+        const Rp22* blk = row + i;
+        for (int h = 0; h < 8; ++h) {
+            const uint16_t* ii = blk->idx + 4 * h;
+            const __m128i g0 = _mm_set_epi64x((long long) iq2s_grid[ii[1]], (long long) iq2s_grid[ii[0]]);
+            const __m128i g1 = _mm_set_epi64x((long long) iq2s_grid[ii[3]], (long long) iq2s_grid[ii[2]]);
+            const uint8_t* sp = blk->sign + 4 * h;
+            const __m128i s0 = _mm_set_epi64x((long long) rp_sign8.v[sp[1]], (long long) rp_sign8.v[sp[0]]);
+            const __m128i s1 = _mm_set_epi64x((long long) rp_sign8.v[sp[3]], (long long) rp_sign8.v[sp[2]]);
+            const uint8_t sb = blk->scale[h];
+            const __m128i c0 = _mm_load_si128((const __m128i*) rp_k16.v[sb & 15]);
+            const __m128i c1 = _mm_load_si128((const __m128i*) rp_k16.v[sb >> 4]);
+            const int off = 32 * h;
+            for (int t = 0; t < NT; ++t) {
+                const uint8_t* q8 = (const uint8_t*) y[t][i].qs + off;
+                a0[t] = _mm_add_epi32(a0[t], _mm_madd_epi16(_mm_maddubs_epi16(g0, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) q8), s0)), c0));
+                a1[t] = _mm_add_epi32(a1[t], _mm_madd_epi16(_mm_maddubs_epi16(g1, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + 16)), s1)), c1));
+            }
+        }
+        const uint16_t dh = (uint16_t) (blk->d[0] | (blk->d[1] << 8));
+        const float dx = h2f_local(dh) * 0.125f;
+        for (int t = 0; t < NT; ++t) {
+            const __m128 f = _mm_cvtepi32_ps(_mm_add_epi32(a0[t], a1[t]));
+            accf[t] = _mm_add_ps(accf[t], _mm_mul_ps(_mm_set1_ps(dx * y[t][i].d), f));
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        __m128 s = _mm_add_ps(accf[t], _mm_movehl_ps(accf[t], accf[t]));
+        s = _mm_add_ss(s, _mm_movehdup_ps(s));
+        res[t] = _mm_cvtss_f32(s);
+    }
+}
+
+// gate/up rows of one expert, repacked layout, mirroring gu_rows (gate dot, up dot, then the SwiGLU)
+template <int NT>
+void rp_gu_rows(const Rp22* gate, const Rp22* up, int n, const void* const* act, float* const* ff, int nrow) {
+    const block_q8_K* y[NT];
+    const int nb = n / QK_K;
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    for (int r = 0; r < nrow; ++r) {
+        float g[NT], u[NT];
+        rp_row_dot<NT>(gate + (size_t) r * nb, nb, y, g);
+        rp_row_dot<NT>(up + (size_t) r * nb, nb, y, u);
+        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+    }
+}
+
+// repack gate+up of nexp experts; returns gate/up pointers per expert
+struct RpBlobs { std::vector<Rp22> buf; size_t nbrow; };
+RpBlobs rp_build(const std::vector<uint8_t>& blob, size_t per, size_t gu_row, size_t up_off, int nexp, int nb, int nrow) {
+    RpBlobs rb; rb.nbrow = (size_t) nrow * nb;
+    rb.buf.resize((size_t) nexp * 2 * rb.nbrow);
+    for (int e = 0; e < nexp; ++e) {
+        const uint8_t* src = blob.data() + (size_t) e * per;
+        Rp22* g = rb.buf.data() + (size_t) e * 2 * rb.nbrow;
+        for (int r = 0; r < nrow; ++r)
+            for (int i = 0; i < nb; ++i) {
+                rp22_block(src + (size_t) r * gu_row + (size_t) i * 82, g + (size_t) r * nb + i);
+                rp22_block(src + up_off + (size_t) r * gu_row + (size_t) i * 82, g + rb.nbrow + (size_t) r * nb + i);
+            }
+    }
+    return rb;
+}
+
+void rp_gu_nt(int nt, const Rp22* g, const Rp22* u, int n, const void* const* act, float* const* ff, int nrow) {
+    switch (nt) {
+        case 1: rp_gu_rows<1>(g, u, n, act, ff, nrow); break;
+        case 2: rp_gu_rows<2>(g, u, n, act, ff, nrow); break;
+        case 3: rp_gu_rows<3>(g, u, n, act, ff, nrow); break;
+        case 4: rp_gu_rows<4>(g, u, n, act, ff, nrow); break;
+        case 5: rp_gu_rows<5>(g, u, n, act, ff, nrow); break;
+        case 6: rp_gu_rows<6>(g, u, n, act, ff, nrow); break;
+        case 7: rp_gu_rows<7>(g, u, n, act, ff, nrow); break;
+        default: rp_gu_rows<8>(g, u, n, act, ff, nrow); break;
+    }
+}
+
 // ---- the checks
 void run_checks() {
     for (const Case& c : kCases) {
@@ -195,8 +343,26 @@ void run_checks() {
         }
         // gate/up: nt = 1..8, every width bit-identical to that token's nt = 1 row (#152), all rel <= 1e-5 vs ggml
         std::vector<std::vector<float>> ff1(kMaxT), out1(kMaxT);
+        RpBlobs rb;   // PROTOTYPE: repacked gate/up for the IQ2_S rungs
+        if (c.gu == 22) rb = rp_build(fx.blob, fx.f.bytes, fx.f.gu_row, fx.f.up_off, 1, kH / QK_K, kFF);
         for (int nt = 1; nt <= kMaxT; ++nt) {
             cpu::iq128_gu_rows(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF);
+            if (c.gu == 22) {
+                // the bar for a repacked layout: bit for bit the rows the current kernel writes, no re-baseline
+                std::vector<std::vector<float>> ffr(kMaxT, std::vector<float>(kFF));
+                float* ffrp[kMaxT];
+                for (int t = 0; t < kMaxT; ++t) ffrp[t] = ffr[t].data();
+                rp_gu_nt(nt, rb.buf.data(), rb.buf.data() + rb.nbrow, kH, actp, ffrp, kFF);
+                // exact=true above: every row compared with memcmp, so 0 failures means the repacked kernel
+                // writes bit for bit what the deployed kernel writes. Say it once, where an operator reads it.
+                if (nt == kMaxT) std::printf("  %-16s gu repacked: bit-identical to the deployed kernel at nt=1..%d\n",
+                                             c.name, kMaxT);
+                for (int t = 0; t < nt; ++t) {
+                    char what[96];
+                    std::snprintf(what, sizeof what, "%s gu rp vs current nt=%d token %d", c.name, nt, t);
+                    check(what, ffr[t], ff[t], true);
+                }
+            }
             for (int t = 0; t < nt; ++t) {
                 char what[96];
                 std::snprintf(what, sizeof what, "%s gu nt=%d vs ggml", c.name, nt);
@@ -296,10 +462,32 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            double ms_rp_gu = 0, ms_iq_gu_best = 0;
+            if (c.gu == 22) {   // PROTOTYPE: same weights, grid indices pre-merged (106-byte blocks).
+                // Alternate the two variants and take the best of 3 - a single shot wanders by 2x at this size.
+                RpBlobs rb = rp_build(blob, per, fx.f.gu_row, fx.f.up_off, nexp, kH / QK_K, kFF);
+                double best_iq = 1e30, best_rp = 1e30;
+                for (int rep = 0; rep < 3; ++rep) {
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_gu_rows(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF);
+                    best_iq = std::min(best_iq, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e) {
+                        const Rp22* g = rb.buf.data() + (size_t) e * 2 * rb.nbrow;
+                        rp_gu_nt(nt, g, g + rb.nbrow, kH, actp, ffp, kFF);
+                    }
+                    best_rp = std::min(best_rp, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
+                ms_iq_gu_best = best_iq / nexp; ms_rp_gu = best_rp / nexp;
+            }
             std::printf("  %-16s nt=%d  ggml %8.2f ms/expert   iq128 %6.2f ms/expert   %.1fx   [gu %.2f vs %.2f = %.2fx  dn %.2f vs %.2f = %.2fx]\n",
                         c.name, nt, ms_ggml / nexp, ms_iq / nexp, ms_ggml / ms_iq,
                         ms_ggml_gu / nexp, ms_iq_gu / nexp, ms_ggml_gu / ms_iq_gu,
                         ms_ggml_dn / nexp, ms_iq_dn / nexp, ms_ggml_dn / ms_iq_dn);
+            if (ms_rp_gu > 0)
+                std::printf("  %-16s nt=%d  gu  current %.3f  vs  REPACKED %.3f ms/expert  = %.3fx (best of 3, alternating)\n",
+                            c.name, nt, ms_iq_gu_best, ms_rp_gu, ms_iq_gu_best / ms_rp_gu);
         }
     }
 }
