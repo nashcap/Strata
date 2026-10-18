@@ -109,6 +109,22 @@ static constexpr EvenSigns even_signs{};
 static_assert(even_signs.v[0] == 0x0101010101010101ull && even_signs.v[1] == 0xFF010101010101FFull,
               "keven_signs_q2xs: byte k = 0xFF when bit k of ksigns_iq2xs[i] is set");
 
+// sgn16() as a 256-entry byte -> 8 sign bytes table (2 KB, L1-resident): byte b -> 0xFF in byte k where bit k
+// of b is set, 0x01 elsewhere.  Same bits as sgn16's and/cmpeq/or, two loads instead of three vector ops.
+struct Sign8 {
+    uint64_t v[256];
+    constexpr Sign8() : v{} {
+        for (int i = 0; i < 256; ++i) {
+            uint64_t r = 0;
+            for (int k = 0; k < 8; ++k) r |= (uint64_t) (((i >> k) & 1) ? 0xFF : 0x01) << (8 * k);
+            v[i] = r;
+        }
+    }
+};
+static constexpr Sign8 sign8{};
+static_assert(sign8.v[0] == 0x0101010101010101ull && sign8.v[1] == 0x01010101010101FFull,
+              "sign8: byte k = 0xFF when bit k of i is set");
+
 // The high index bits of a 32-value half spread one per byte (iq_avx2.cpp's HiSpread): punpcklbw puts them
 // next to the low index bytes, so every grid index is a 16-bit load.  IQ3_S: byte k = bit k (the 9th bit of
 // index k).  IQ2_S: byte k = bits 2k,2k+1 (bits 8-9 of index k), k < 4.
@@ -208,9 +224,9 @@ template <> struct Fmt128<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign by
                             (long long) iq2s_grid[_mm_extract_epi16(idx, 0)]);
         g1 = _mm_set_epi64x((long long) iq2s_grid[_mm_extract_epi16(idx, 3)],
                             (long long) iq2s_grid[_mm_extract_epi16(idx, 2)]);
-        const uint32_t sg = u32(b + 2 + 32 + 8 * j + 4 * half);
-        s0 = sgn16(sg, 0);
-        s1 = sgn16(sg, 1);
+        const uint8_t* sp = b + 2 + 32 + 8 * j + 4 * half;   // sgn16(sg,0) == [sign8[sp[0]], sign8[sp[1]]]
+        s0 = _mm_set_epi64x((long long) sign8.v[sp[1]], (long long) sign8.v[sp[0]]);
+        s1 = _mm_set_epi64x((long long) sign8.v[sp[3]], (long long) sign8.v[sp[2]]);
         const uint8_t sb = b[74 + 2 * j + half];
         c0 = _mm_set1_epi16((short) (2 * (sb & 15) + 1));
         c1 = _mm_set1_epi16((short) (2 * (sb >> 4) + 1));
