@@ -17,6 +17,10 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
+#define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
+
 #include "ggml.h"
 #include "ggml-cpu.h"
 
@@ -294,6 +298,16 @@ int main(int argc, char** argv) {
         if (sched_setaffinity(0, sizeof set, &set) != 0) std::fprintf(stderr, "pinning to CPU %d failed\n", cpu_pin);
     }
 #endif
+    // The IQ3_XXS/IQ3_S fold adds two int16 partial dots before the scale multiply, so 4*127*grid_max has to
+    // stay inside int16.  Scan the tables: they pack four magnitudes per uint32 entry in this ggml.
+    auto gmax = [](const uint32_t* tab, int n) { int m = 0;
+        for (int i = 0; i < n; ++i) for (int s = 0; s < 4; ++s) m = std::max(m, (int) ((tab[i] >> (8 * s)) & 0xFF));
+        return m; };
+    for (auto pr : { std::pair{"iq3xxs_grid", gmax(iq3xxs_grid, 256)}, std::pair{"iq3s_grid", gmax(iq3s_grid, 512)} })
+        if (4 * 127 * pr.second >= 32768) {
+            std::printf("  FAIL %s: max magnitude %d, the folded halves would saturate int16\n", pr.first, pr.second);
+            ++failures;
+        }
     if (!cpu::cpu_avx1_ok()) { std::printf("iq_avx1_parity: no AVX here, the kernels would not run\n"); return 0; }
     std::printf("iq_avx1_parity: %s\n", cpu::cpu_avx1_ok() ? "AVX1 kernels checked (128-bit lanes)" : "");
     if (bench) { run_bench(mb, nts); return failures != 0; }
