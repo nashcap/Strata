@@ -1620,6 +1620,7 @@ if(STRATA_NATIVE_EXPERTS)
   # on an AVX2 machine it checks the older-CPU path as an AVX-only machine would run it.
   add_executable(iq_avx1_parity src/kernels/cpu/iq_avx1_parity.cpp)
   target_link_libraries(iq_avx1_parity PRIVATE strata_kernels_cpu)
+  target_include_directories(iq_avx1_parity PRIVATE third_party/ggml)   # the parity tool scans the codebook grids themselves
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx1_parity COMMAND iq_avx1_parity)
   endif()

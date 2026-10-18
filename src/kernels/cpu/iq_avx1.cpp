@@ -264,6 +264,30 @@ inline __m128i madd_add(__m128i acc, __m128i g, __m128i sgn, __m128i yv, __m128i
     return _mm_add_epi32(acc, _mm_madd_epi16(_mm_maddubs_epi16(g, _mm_sign_epi8(yv, sgn)), sc));
 }
 
+// The grid tables pack four int8 magnitudes per uint32 entry in this ggml (GGML_TABLE_BEGIN(uint32_t, ...)).
+constexpr int grid_byte_max(const uint32_t* t, int n) {
+    int m = 0;
+    for (int i = 0; i < n; ++i)
+        for (int s = 0; s < 4; ++s) { const int b = (int) ((t[i] >> (8 * s)) & 0xFF); if (b > m) m = b; }
+    return m;
+}
+
+// madd_add_fold is madd_add with the two 16-value halves of a 32-value sub-block folded into one int16 vector
+// before the scale multiply: when c0 == c1 == c, madd(d0,c) + madd(d1,c) == madd(d0+d1, c) exactly, so one
+// pmaddwd (ports 0/1 only) is replaced by one paddw (ports 0, 1 and 5).  Bit for bit the same int32 sum, as
+// long as d0+d1 stays inside int16: each half is |d| <= 2*grid_max*127, so the pair stays under 4*127*max.
+// Guarded against the tables themselves, not against a hand-written constant, because the IQ3_XXS margin is
+// only 4% (31496 vs 32767) and a table change would otherwise turn this into silent saturation.
+// The margin here is only 4%: this ggml packs four int8 magnitudes per uint32 table entry, iq3xxs_grid
+// reaches 62 (4*127*62 = 31496 < 32768) and iq3s_grid reaches 15 (7620).  iq_avx1_parity scans both tables and
+// fails if that ever stops holding, because the failure mode would be silent saturation.
+inline __m128i madd_add_fold(__m128i acc, __m128i g0, __m128i g1, __m128i sgn0, __m128i sgn1,
+                             __m128i y0, __m128i y1, __m128i sc) {
+    const __m128i d = _mm_add_epi16(_mm_maddubs_epi16(g0, _mm_sign_epi8(y0, sgn0)),
+                                    _mm_maddubs_epi16(g1, _mm_sign_epi8(y1, sgn1)));
+    return _mm_add_epi32(acc, _mm_madd_epi16(d, sc));
+}
+
 // ---- the row kernels (iq_avx2_rows.inl's row_dot in 128-bit lanes)
 // R rows of the SAME expert through one block loop: the per-half decode chains (index byte -> grid table ->
 // madd) are ~20 cycles of pure latency and at NT=1 there is nothing to overlap, so the kernel runs latency-
@@ -288,6 +312,20 @@ inline void row_dot_r(const uint8_t* const* rows, int nblocks, const block_q8_K*
                     Fmt128<TY>::decode(blk, j, half, g0[rr], g1[rr], s0[rr], s1[rr], c0[rr], c1[rr]);
                 }
                 const int off = 64 * j + 32 * half;
+                // c0 == c1 in IQ3_XXS and IQ3_S (one 4-bit scale per 32 values): fold the halves, one pmaddwd
+                // instead of two.  IQ2_S (two scales) and IQ4_XS (grid up to 127, would saturate) stay on the
+                // two-accumulator path - and the fold needs both halves' decode, so it is per row, not shared.
+                if constexpr (TY == 18 || TY == 21) {
+                    for (int rr = 0; rr < R; ++rr) {
+                        for (int t = 0; t < NT; ++t) {
+                            const uint8_t* q8 = (const uint8_t*) (y[t][i].qs + off);
+                            acci[rr][t][0] = madd_add_fold(acci[rr][t][0], g0[rr], g1[rr], s0[rr], s1[rr],
+                                                           _mm_loadu_si128((const __m128i*) q8),
+                                                           _mm_loadu_si128((const __m128i*) (q8 + 16)), c0[rr]);
+                        }
+                    }
+                    continue;
+                }
                 for (int rr = 0; rr < R; ++rr) {
                     for (int t = 0; t < NT; ++t) {
                         const uint8_t* q8 = (const uint8_t*) (y[t][i].qs + off);
