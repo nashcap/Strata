@@ -492,6 +492,189 @@ inline void gu_rows_phased(const uint8_t* blob, size_t gu_row, size_t up_off, in
     }
 }
 
+
+// MODE 5 (measurement): the same phasing applied to IQ3_S, which is a folded format.  The fold sums both halves'
+// int16 products before ONE pmaddwd; a 16-value phase cannot do that, so this pays one extra pmaddwd and one
+// extra accumulator per 32 values to get the live set down to 3 + 2 per row.  Whether the registers are worth
+// more than the fold is exactly what this measures.
+static inline void iq3s_dec16(__m128i idx, uint32_t sg, uint8_t sc, int half, int which,
+                              __m128i& g, __m128i& s, __m128i& c) {
+    const int m = 4 * which;
+#define G4(o) (int) iq3s_grid[_mm_extract_epi16(idx, m + (o))]
+    g = _mm_set_epi32(G4(3), G4(2), G4(1), G4(0));
+#undef G4
+    s = sgn16(sg, which);
+    c = _mm_load_si128((const __m128i*) kscale16.v[half ? sc >> 4 : sc & 15]);
+}
+
+template <int TY>
+inline void gu_rows_phased30(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                             float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag0 = _mm_setzero_si128(), ag1 = _mm_setzero_si128();
+            __m128i au0 = _mm_setzero_si128(), au1 = _mm_setzero_si128();
+            for (int j = 0; j < 4; ++j) {
+                for (int half = 0; half < 2; ++half) {
+                    const int off = 64 * j + 32 * half;
+                    const __m128i ig = grid_idx(gb + 2 + 16 * j + 8 * half, hi_spread.iq3s[gb[66 + 2 * j + half]]);
+                    const __m128i iu = grid_idx(ub + 2 + 16 * j + 8 * half, hi_spread.iq3s[ub[66 + 2 * j + half]]);
+                    const uint32_t sgs = u32(gb + 74 + 8 * j + 4 * half), sgsu = u32(ub + 74 + 8 * j + 4 * half);
+                    const uint8_t sbg = gb[106 + j], sbu = ub[106 + j];
+                    __m128i g, s, c;
+                    const __m128i yv0 = _mm_loadu_si128((const __m128i*) (q8 + off));
+                    iq3s_dec16(ig, sgs, sbg, half, 0, g, s, c); ag0 = madd_add(ag0, g, s, yv0, c);
+                    iq3s_dec16(iu, sgsu, sbu, half, 0, g, s, c); au0 = madd_add(au0, g, s, yv0, c);
+                    const __m128i yv1 = _mm_loadu_si128((const __m128i*) (q8 + off + 16));
+                    iq3s_dec16(ig, sgs, sbg, half, 1, g, s, c); ag1 = madd_add(ag1, g, s, yv1, c);
+                    iq3s_dec16(iu, sgsu, sbu, half, 1, g, s, c); au1 = madd_add(au1, g, s, yv1, c);
+                }
+            }
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(ag0, ag1))));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(au0, au1))));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
+
+// MODE 6 (measurement): the phased IQ2_S shape at TWO tokens.  At one token the phasing won because the live set
+// hit the 16-register wall; at two tokens the shipped path amortises one decode over two tokens and needs fewer
+// registers per row, so the register argument may not apply.  This says whether the phasing generalises or is a
+// one-token-only fix.
+template <int TY, int NT>
+inline void gu_rows_phased2(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                            float* const* ff, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg[NT], fu[NT];
+        for (int t = 0; t < NT; ++t) fg[t] = fu[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            __m128i ag[NT][2], au[NT][2];
+            for (int t = 0; t < NT; ++t)
+                for (int w = 0; w < 2; ++w) ag[t][w] = au[t][w] = _mm_setzero_si128();
+            for (int j = 0; j < 4; ++j) {
+                for (int half = 0; half < 2; ++half) {
+                    const int off = 64 * j + 32 * half;
+                    const __m128i ig = grid_idx(gb + 2 + 8 * j + 4 * half, hi_spread.iq2s[gb[66 + 2 * j + half]]);
+                    const __m128i iu = grid_idx(ub + 2 + 8 * j + 4 * half, hi_spread.iq2s[ub[66 + 2 * j + half]]);
+                    const uint8_t* spg = gb + 2 + 32 + 8 * j + 4 * half;
+                    const uint8_t* spu = ub + 2 + 32 + 8 * j + 4 * half;
+                    const uint8_t sbg = gb[74 + 2 * j + half], sbu = ub[74 + 2 * j + half];
+                    __m128i g, sg_, c;
+                    for (int which = 0; which < 2; ++which) {
+                        iq2s_dec16(ig, spg, sbg, which, g, sg_, c);
+                        for (int t = 0; t < NT; ++t) {
+                            const __m128i yv = _mm_loadu_si128((const __m128i*) (y[t][i].qs + off + 16 * which));
+                            ag[t][which] = madd_add(ag[t][which], g, sg_, yv, c);
+                        }
+                        iq2s_dec16(iu, spu, sbu, which, g, sg_, c);
+                        for (int t = 0; t < NT; ++t) {
+                            const __m128i yv = _mm_loadu_si128((const __m128i*) (y[t][i].qs + off + 16 * which));
+                            au[t][which] = madd_add(au[t][which], g, sg_, yv, c);
+                        }
+                    }
+                }
+            }
+            const float dg = h2f(u16(gb)) * Fmt128<TY>::K, du = h2f(u16(ub)) * Fmt128<TY>::K;
+            for (int t = 0; t < NT; ++t) {
+                const float dy = y[t][i].d;
+                fg[t] = _mm_add_ps(fg[t], _mm_mul_ps(_mm_set1_ps(dg * dy), _mm_cvtepi32_ps(_mm_add_epi32(ag[t][0], ag[t][1]))));
+                fu[t] = _mm_add_ps(fu[t], _mm_mul_ps(_mm_set1_ps(du * dy), _mm_cvtepi32_ps(_mm_add_epi32(au[t][0], au[t][1]))));
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            const float hg = hsum4(fg[t]), hu = hsum4(fu[t]);
+            ff[t][r] = (hg / (1.f + std::exp(-hg))) * hu;
+        }
+    }
+}
+
+
+// MODE 7 (measurement): phasing a FOLDED format while KEEPING the fold.  Mode 5 un-folded and that was my error:
+// the fold is only an int16 add of the two halves' partial products before ONE pmaddwd, so a phase can build that
+// int16 sum incrementally.  Live per row per phase: g, s, c + the int16 partial + one int32 accumulator = 5, the
+// same as the phased IQ2_S shape, with no extra pmaddwd and bit-identical by construction (same ops, same order).
+static inline void iq3x_dec16(int ty, const uint8_t* b, int j, int half, int which, __m128i& g, __m128i& s,
+                              __m128i& c) {
+    if (ty == 18) {                                        // IQ3_XXS: byte grid indices, u32 sign+scale word
+        const uint8_t* q = b + 2 + 16 * j + 8 * half + 4 * which;
+#define GX(o) (int) iq3xxs_grid[q[o]]
+        g = _mm_set_epi32(GX(3), GX(2), GX(1), GX(0));
+#undef GX
+        const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
+        const int a = which ? ((w >> 14) & 127) : (w & 127), e2 = which ? ((w >> 21) & 127) : ((w >> 7) & 127);
+        s = _mm_set_epi64x((long long) even_signs.v[e2], (long long) even_signs.v[a]);
+        c = _mm_load_si128((const __m128i*) kscale16.v[w >> 28]);
+    } else {                                               // IQ3_S: 9-bit indices, sign word, shared sub-scale
+        const __m128i idx = grid_idx(b + 2 + 16 * j + 8 * half, hi_spread.iq3s[b[66 + 2 * j + half]]);
+        const int m = 4 * which;
+#define GS(o) (int) iq3s_grid[_mm_extract_epi16(idx, m + (o))]
+        g = _mm_set_epi32(GS(3), GS(2), GS(1), GS(0));
+#undef GS
+        s = sgn16(u32(b + 74 + 8 * j + 4 * half), which);
+        const uint8_t sc = b[106 + j];
+        c = _mm_load_si128((const __m128i*) kscale16.v[half ? sc >> 4 : sc & 15]);
+    }
+}
+
+template <int TY>
+inline void gu_rows_phased31(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                             float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag = _mm_setzero_si128(), au = _mm_setzero_si128();
+            for (int j = 0; j < 4; ++j) {
+                for (int half = 0; half < 2; ++half) {
+                    const int off = 64 * j + 32 * half;
+                    __m128i pg = _mm_setzero_si128(), pu = _mm_setzero_si128(), g, sg_, c, ct;
+                    iq3x_dec16(TY, gb, j, half, 0, g, sg_, c); ct = c;
+                    pg = _mm_maddubs_epi16(g, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + off)), sg_));
+                    iq3x_dec16(TY, ub, j, half, 0, g, sg_, c);
+                    pu = _mm_maddubs_epi16(g, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + off)), sg_));
+                    iq3x_dec16(TY, gb, j, half, 1, g, sg_, c);
+                    pg = _mm_add_epi16(pg, _mm_maddubs_epi16(g, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + off + 16)), sg_)));
+                    iq3x_dec16(TY, ub, j, half, 1, g, sg_, c);
+                    pu = _mm_add_epi16(pu, _mm_maddubs_epi16(g, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + off + 16)), sg_)));
+                    ag = _mm_add_epi32(ag, _mm_madd_epi16(pg, ct));
+                    au = _mm_add_epi32(au, _mm_madd_epi16(pu, c));
+                }
+            }
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy), _mm_cvtepi32_ps(ag)));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy), _mm_cvtepi32_ps(au)));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
 template <int TY> void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                const void* const* act, float* const* ff, int r0, int r1);
 
@@ -507,6 +690,9 @@ void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, 
             case 2: gu_rows<TY, 1, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 3: gu_rows<TY, 1, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 4: gu_rows_phased<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 5: gu_rows_phased30<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 6: gu_rows_phased2<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 7: gu_rows_phased31<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             default: gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
         }
     }
@@ -749,8 +935,8 @@ void iq128_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
     // alternating, 7 samples): IQ3_S +4.9% (7/7 samples), IQ2_S +2.6% (6/7), IQ3_XXS flat, IQ4_XS -23%.  So the
     // mode is chosen per type, not globally, and every mode writes bit for bit the same rows.
     switch (type) {
-        case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
-        case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 1); break;
+        case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 7); break;   // phased, fold kept
+        case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 7); break;   // phased, fold kept
         case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 4); break;   // phased 16-value decode
         case 23: gu_rows_nt_mode<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
         default: break;

@@ -568,13 +568,27 @@ void run_checks() {
                     }
                 }
             }
+            if (nt == 2 && c.gu == 22) {   // the two-token phased shape against the shipped two-token path
+                std::vector<std::vector<float>> ff6(kMaxT, std::vector<float>(kFF));
+                float* ff6p[kMaxT];
+                for (int t = 0; t < kMaxT; ++t) ff6p[t] = ff6[t].data();
+                cpu::iq128_gu_rows_mode(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ff6p, 0, kFF, 6);
+                for (int t = 0; t < nt; ++t) {
+                    char what[96];
+                    std::snprintf(what, sizeof what, "%s gu phased nt=2 token %d", c.name, t);
+                    check(what, ff6[t], ff[t], true);
+                }
+            }
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {
                 // every row pairing must write bit for bit what the shipped one writes (exact = memcmp)
                 std::vector<std::vector<float>> ffm(kMaxT, std::vector<float>(kFF));
                 float* ffmp[kMaxT];
                 for (int t = 0; t < kMaxT; ++t) ffmp[t] = ffm[t].data();
-                for (int mode : {0, 2, 3, 4}) {
-                    if (mode == 4 && c.gu != 22) continue;   // the phased shape reads IQ2_S's block layout
+                for (int mode : {0, 2, 3, 4, 5, 7}) {
+                    if (mode == 4 && c.gu != 22) continue;   // the phased shapes read one format's layout
+                    if (mode == 5 && c.gu != 21) continue;
+                    if (mode == 7 && (c.gu != 21 && c.gu != 18)) continue;
+                    if (mode == 6 && (c.gu != 22 || nt != 1)) continue;   // two-token shape: checked at nt=2 below
                     cpu::iq128_gu_rows_mode(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffmp, 0, kFF, mode);
                     char what[96];
                     std::snprintf(what, sizeof what, "%s gu pairing mode=%d nt=1", c.name, mode);
@@ -680,11 +694,30 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                if (nt == 2 && c.gu == 22) {   // does the phased shape generalise to two tokens?
+                double bs = 1e30, bp = 1e30;
+                for (int rep = 0; rep < 5; ++rep) {
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_gu_rows(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF);
+                    bs = std::min(bs, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_gu_rows_mode(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffp, 0, kFF, 6);
+                    bp = std::min(bp, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
+                std::printf("  %-16s nt=2  phased at 2 tokens: shipped %.3f vs phased %.3f = %.3fx (min of 5 alternating)\n",
+                            c.name, bs / nexp, bp / nexp, bs / bp);
+            }
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {   // row pairing / hoist A/B
-                double b[5] = {1e30, 1e30, 1e30, 1e30, 1e30};
+            double b[8] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
                 for (int rep = 0; rep < 5; ++rep)
-                    for (int mode = 0; mode < 5; ++mode) {
-                        if (mode >= 4 && c.gu != 22) continue;   // the phased shape is IQ2_S only
+                    for (int mode = 0; mode < 8; ++mode) {
+                        if (mode == 4 && c.gu != 22) continue;
+                        if (mode == 5 && c.gu != 21) continue;
+                        if (mode == 6) continue;          // two-token shape, measured at nt=2
+                    if (mode == 7 && (c.gu != 21 && c.gu != 18)) continue;
+                    if (mode == 6 && (c.gu != 22 || nt != 1)) continue;   // two-token shape: checked at nt=2 below   // each phased shape reads one format's layout
                         t0 = Clock::now();
                         for (int e = 0; e < nexp; ++e)
                             cpu::iq128_gu_rows_mode(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off,
@@ -694,6 +727,12 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 std::printf("  %-16s nt=1  pairing old %.3f | pair+hoist %.3f (%.3fx) | hoist %.3f (%.3fx) | R=4 %.3f (%.3fx) | phased16 %.3f (%.3fx vs old, %.3fx vs shipped) min of 5 alternating\n",
                             c.name, b[0] / nexp, b[1] / nexp, b[0] / b[1], b[2] / nexp, b[0] / b[2], b[3] / nexp, b[0] / b[3],
                             b[4] / nexp, b[0] / b[4], b[1] / b[4]);
+                if (c.gu == 21)
+                    std::printf("  %-16s nt=1  IQ3_S phased-unfolded %.3f vs shipped %.3f = %.3fx (min of 5 alternating)\n",
+                                c.name, b[5] / nexp, b[1] / nexp, b[1] / b[5]);
+                if (c.gu == 21 || c.gu == 18)
+                    std::printf("  %-16s nt=1  IQ3 phased-with-fold %.3f vs shipped %.3f = %.3fx (min of 5 alternating)\n",
+                                c.name, b[7] / nexp, b[1] / nexp, b[1] / b[7]);
             }
             double ms_rp_gu = 0, ms_iq_gu_best = 0, ms_rpu_gu = 0;
             const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
