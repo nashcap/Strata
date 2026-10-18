@@ -610,6 +610,17 @@ void run_checks() {
         // down
         for (int nt = 1; nt <= kMaxT; ++nt) {
             cpu::iq128_down_rows(c.dn, fx.blob.data() + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
+            if (nt == 1 && c.dn == 20) {   // the pabsb down shape against the shipped down path
+                std::vector<std::vector<float>> otv(kMaxT, std::vector<float>(kH));
+                float* o1p[kMaxT];
+                for (int t = 0; t < kMaxT; ++t) o1p[t] = otv[t].data();
+                cpu::iq128_down_rows_mode(c.dn, fx.blob.data() + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, o1p, 0, kH, 1);
+                char what[96];
+                std::snprintf(what, sizeof what, "%s dn pabsb nt=1", c.name);
+                check(what, otv[0], out[0], true);
+                (void) out1;
+            }
+
             for (int t = 0; t < nt; ++t) {
                 char what[96];
                 std::snprintf(what, sizeof what, "%s down nt=%d vs ggml", c.name, nt);
@@ -694,7 +705,22 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-                if (nt == 2 && c.gu == 22) {   // does the phased shape generalise to two tokens?
+                if (nt == 1 && c.dn == 20) {   // pabsb down vs shipped down
+                double bs = 1e30, bp = 1e30;
+                for (int rep = 0; rep < 7; ++rep) {
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
+                    bs = std::min(bs, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_down_rows_mode(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH, 1);
+                    bp = std::min(bp, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
+                std::printf("  %-16s nt=1  down pabsb %.3f vs shipped %.3f = %.3fx (min of 7 alternating)\n",
+                            c.name, bp / nexp, bs / nexp, bs / bp);
+            }
+            if (nt == 2 && c.gu == 22) {   // does the phased shape generalise to two tokens?
                 double bs = 1e30, bp = 1e30;
                 for (int rep = 0; rep < 5; ++rep) {
                     t0 = Clock::now();

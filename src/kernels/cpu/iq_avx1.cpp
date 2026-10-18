@@ -719,7 +719,7 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
 // the first 128-bit kernel here.  The row loop takes the same two-block shape, but decodes each block pair
 // ONCE and lets every token share it - which ggml's per-token dot cannot - and keeps the int32 madd chain
 // (exact) with a single 256-bit cvt per pair.
-template <int NT>
+template <int NT, bool DERIVE>
 void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y, float* const* out,
                 int r0, int r1) {
     const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
@@ -751,8 +751,11 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
             const __m128i v01 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits0, 4), m4b));
             const __m128i v10 = _mm_shuffle_epi8(values, _mm_and_si128(bits1, m4b));
             const __m128i v11 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits1, 4), m4b));
-            const __m128i a00 = _mm_sign_epi8(v00, v00), a01 = _mm_sign_epi8(v01, v01);   // |w|: the unsigned maddubs operand
-            const __m128i a10 = _mm_sign_epi8(v10, v10), a11 = _mm_sign_epi8(v11, v11);
+            __m128i a00, a01, a10, a11;      // |w|: the unsigned maddubs operand
+            if (!DERIVE) {                   // DERIVE: keep only v* live and take |w| with pabsb at the use site
+                a00 = _mm_sign_epi8(v00, v00); a01 = _mm_sign_epi8(v01, v01);
+                a10 = _mm_sign_epi8(v10, v10); a11 = _mm_sign_epi8(v11, v11);
+            }
             const float dx0 = h2f(u16(blk0)), dx1 = h2f(u16(blk1));
             for (int t = 0; t < NT; ++t) {
                 const uint8_t* q8a = (const uint8_t*) y[t][ib].qs;
@@ -762,11 +765,11 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
                 const __m128i yb0 = _mm_loadu_si128((const __m128i*) q8b);
                 const __m128i yb1 = _mm_loadu_si128((const __m128i*) (q8b + 16));
                 const __m128i pa = _mm_add_epi32(
-                    _mm_madd_epi16(_mm_maddubs_epi16(a00, _mm_sign_epi8(ya0, v00)), ones),
-                    _mm_madd_epi16(_mm_maddubs_epi16(a01, _mm_sign_epi8(ya1, v01)), ones));
+                    _mm_madd_epi16(_mm_maddubs_epi16(DERIVE ? _mm_abs_epi8(v00) : a00, _mm_sign_epi8(ya0, v00)), ones),
+                    _mm_madd_epi16(_mm_maddubs_epi16(DERIVE ? _mm_abs_epi8(v01) : a01, _mm_sign_epi8(ya1, v01)), ones));
                 const __m128i pb = _mm_add_epi32(
-                    _mm_madd_epi16(_mm_maddubs_epi16(a10, _mm_sign_epi8(yb0, v10)), ones),
-                    _mm_madd_epi16(_mm_maddubs_epi16(a11, _mm_sign_epi8(yb1, v11)), ones));
+                    _mm_madd_epi16(_mm_maddubs_epi16(DERIVE ? _mm_abs_epi8(v10) : a10, _mm_sign_epi8(yb0, v10)), ones),
+                    _mm_madd_epi16(_mm_maddubs_epi16(DERIVE ? _mm_abs_epi8(v11) : a11, _mm_sign_epi8(yb1, v11)), ones));
                 const __m256 p = _mm256_cvtepi32_ps(_mm256_castps_si256(_mm256_set_m128(_mm_castsi128_ps(pb), _mm_castsi128_ps(pa))));
                 const __m256 dd = _mm256_set_m128(_mm_set1_ps(dx1 * yd[(size_t) t * nb + ib + 1]),
                                                   _mm_set1_ps(dx0 * yd[(size_t) t * nb + ib]));
@@ -778,7 +781,8 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
             const __m128i bits = _mm_loadu_si128((const __m128i*) (blk + 2));
             const __m128i v0 = _mm_shuffle_epi8(values, _mm_and_si128(bits, m4b));
             const __m128i v1 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), m4b));
-            const __m128i aq0 = _mm_sign_epi8(v0, v0), aq1 = _mm_sign_epi8(v1, v1);
+            const __m128i aq0 = DERIVE ? _mm_abs_epi8(v0) : _mm_sign_epi8(v0, v0);
+            const __m128i aq1 = DERIVE ? _mm_abs_epi8(v1) : _mm_sign_epi8(v1, v1);
             const float dx = h2f(u16(blk));
             for (int t = 0; t < NT; ++t) {
                 const uint8_t* q8 = (const uint8_t*) y[t][ib].qs;
@@ -954,6 +958,17 @@ void iq128_gu_rows_mode(int type, const uint8_t* blob, size_t gu_row, size_t up_
     }
 }
 
+// mode 1 = IQ4_NL at one token with |w| derived by pabsb instead of kept live (a register-census change).
+// MEASURED, NOT USED: 12 paired samples at nt=1 gave mean 0.983x, 3/12 positive (0.941x to 1.026x).  The gate/up
+// kernels won by shrinking the live set; this one does not, so the down loop is not register-limited the same way -
+// it carries one accumulator per token and the 2x block unroll is what supplies its instruction-level parallelism.
+void iq128_down_rows_mode(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
+                          float* const* out, int r0, int r1, int mode) {
+    const block_q8_0* y0 = (const block_q8_0*) hq[0];
+    if (mode == 1 && type == 20 && nt == 1) { iq4nl_rows<1, true>(w, row_bytes, n, &y0, out, r0, r1); return; }
+    iq128_down_rows(type, w, row_bytes, n, hq, nt, out, r0, r1);
+}
+
 void iq128_down_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                      float* const* out, int r0, int r1) {
     const block_q8_0* y[8];
@@ -962,10 +977,10 @@ void iq128_down_rows(int type, const uint8_t* w, size_t row_bytes, int n, const 
         for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
             switch (k) {
-                case 1: iq4nl_rows<1>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
-                case 2: iq4nl_rows<2>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
-                case 3: iq4nl_rows<3>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
-                default: iq4nl_rows<4>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
+                case 1: iq4nl_rows<1,false>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
+                case 2: iq4nl_rows<2,false>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
+                case 3: iq4nl_rows<3,false>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
+                default: iq4nl_rows<4,false>(w, row_bytes, n, y + t0, out + t0, r0, r1); break;
             }
         }
         return;
