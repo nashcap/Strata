@@ -675,6 +675,70 @@ inline void gu_rows_phased31(const uint8_t* blob, size_t gu_row, size_t up_off, 
     }
 }
 
+// MODE 8 (measurement, report-8 proposal A): the phased IQ2_S shape with both rows' weights decoded and held live
+// together, so the two rows' L1 table lookups issue in parallel, and the sub-scale left as a memory operand for
+// vpmaddwd rather than a live register.  Census 4 live vectors per row.  Per-row arithmetic and its order unchanged.
+static inline __m128i madd_add_c(__m128i acc, __m128i g, __m128i s, __m128i yv, const int8_t* c) {
+    return _mm_add_epi32(acc, _mm_madd_epi16(_mm_maddubs_epi16(g, _mm_sign_epi8(yv, s)),
+                                             _mm_load_si128((const __m128i*) c)));
+}
+
+template <int TY>
+inline void gu_rows_dualstream(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                               float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag0 = _mm_setzero_si128(), ag1 = _mm_setzero_si128();
+            __m128i au0 = _mm_setzero_si128(), au1 = _mm_setzero_si128();
+            for (int j = 0; j < 4; ++j) {
+                for (int half = 0; half < 2; ++half) {
+                    const int off = 64 * j + 32 * half;
+                    const __m128i ig = grid_idx(gb + 2 + 8 * j + 4 * half, hi_spread.iq2s[gb[66 + 2 * j + half]]);
+                    const __m128i iu = grid_idx(ub + 2 + 8 * j + 4 * half, hi_spread.iq2s[ub[66 + 2 * j + half]]);
+                    const uint8_t* spg = gb + 2 + 32 + 8 * j + 4 * half;
+                    const uint8_t* spu = ub + 2 + 32 + 8 * j + 4 * half;
+                    const uint8_t sbg = gb[74 + 2 * j + half], sbu = ub[74 + 2 * j + half];
+                    for (int which = 0; which < 2; ++which) {
+                        const int8_t* cg = (const int8_t*) kscale16.v[which ? (sbg >> 4) : (sbg & 15)];
+                        const int8_t* cu = (const int8_t*) kscale16.v[which ? (sbu >> 4) : (sbu & 15)];
+                        const __m128i yv = _mm_loadu_si128((const __m128i*) (q8 + off + 16 * which));
+                        const __m128i gg = _mm_set_epi64x((long long) iq2s_grid[_mm_extract_epi16(ig, 2 * which + 1)],
+                                                          (long long) iq2s_grid[_mm_extract_epi16(ig, 2 * which)]);
+                        const __m128i gu = _mm_set_epi64x((long long) iq2s_grid[_mm_extract_epi16(iu, 2 * which + 1)],
+                                                          (long long) iq2s_grid[_mm_extract_epi16(iu, 2 * which)]);
+                        const __m128i sg = _mm_set_epi64x((long long) sign8.v[spg[2 * which + 1]],
+                                                          (long long) sign8.v[spg[2 * which]]);
+                        const __m128i su = _mm_set_epi64x((long long) sign8.v[spu[2 * which + 1]],
+                                                          (long long) sign8.v[spu[2 * which]]);
+                        if (which == 0) {
+                            ag0 = madd_add_c(ag0, gg, sg, yv, cg);
+                            au0 = madd_add_c(au0, gu, su, yv, cu);
+                        } else {
+                            ag1 = madd_add_c(ag1, gg, sg, yv, cg);
+                            au1 = madd_add_c(au1, gu, su, yv, cu);
+                        }
+                    }
+                }
+            }
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(ag0, ag1))));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(au0, au1))));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
 template <int TY> void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                const void* const* act, float* const* ff, int r0, int r1);
 
@@ -693,6 +757,7 @@ void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, 
             case 5: gu_rows_phased30<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 6: gu_rows_phased2<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             case 7: gu_rows_phased31<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
+            case 8: gu_rows_dualstream<TY>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
             default: gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); return;
         }
     }
@@ -962,10 +1027,83 @@ void iq128_gu_rows_mode(int type, const uint8_t* blob, size_t gu_row, size_t up_
 // MEASURED, NOT USED: 12 paired samples at nt=1 gave mean 0.983x, 3/12 positive (0.941x to 1.026x).  The gate/up
 // kernels won by shrinking the live set; this one does not, so the down loop is not register-limited the same way -
 // it carries one accumulator per token and the 2x block unroll is what supplies its instruction-level parallelism.
+// MODE 9 (measurement, report-8 proposal B): two IQ4_NL down rows in flight sharing the activation loads.  The
+// per-row arithmetic is a copy of iq4nl_rows' - same 2-block unroll, block ib in lanes 0..3 and ib+1 in lanes 4..7,
+// one cvt / one mul / one add per pair of blocks - because any other float grouping changes the bits.
+void iq4nl_down_pair_nt1(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y,
+                         float* const* out, int r0, int r1) {
+    const int nb = n / QK4_NL;
+    const block_q8_0* y0 = y[0];
+    if (nb & 1) { iq4nl_rows<1, false>(w, row_bytes, n, &y0, out, r0, r1); return; }   // keep the shipped grouping
+    const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+    const __m128i ones = _mm_set1_epi16(1);
+    const int pf = prefetch_distance();
+    std::vector<float> yd(nb);
+    for (int ib = 0; ib < nb; ++ib) yd[ib] = h2f(y0[ib].d);
+    int r = r0;
+    for (; r + 1 < r1; r += 2) {
+        const uint8_t* rowA = w + (size_t) r * row_bytes;
+        const uint8_t* rowB = w + (size_t) (r + 1) * row_bytes;
+        __m256 accA = _mm256_setzero_ps(), accB = _mm256_setzero_ps();
+        for (int ib = 0; ib < nb; ib += 2) {
+            const uint8_t* A0 = rowA + (size_t) ib * sizeof(block_iq4_nl);
+            const uint8_t* A1 = A0 + sizeof(block_iq4_nl);
+            const uint8_t* B0 = rowB + (size_t) ib * sizeof(block_iq4_nl);
+            const uint8_t* B1 = B0 + sizeof(block_iq4_nl);
+            rows_ahead(A0, pf); rows_ahead(B0, pf);
+            const uint8_t* q8 = (const uint8_t*) y0[ib].qs;
+            const uint8_t* q8b = (const uint8_t*) y0[ib + 1].qs;
+            const __m128i ya0 = _mm_loadu_si128((const __m128i*) q8);
+            const __m128i ya1 = _mm_loadu_si128((const __m128i*) (q8 + 16));
+            const __m128i yb0 = _mm_loadu_si128((const __m128i*) q8b);
+            const __m128i yb1 = _mm_loadu_si128((const __m128i*) (q8b + 16));
+            const __m128i tA0 = _mm_loadu_si128((const __m128i*) (A0 + 2));
+            const __m128i tA1 = _mm_loadu_si128((const __m128i*) (A1 + 2));
+            const __m128i tB0 = _mm_loadu_si128((const __m128i*) (B0 + 2));
+            const __m128i tB1 = _mm_loadu_si128((const __m128i*) (B1 + 2));
+            const __m128i vA0 = _mm_shuffle_epi8(values, _mm_and_si128(tA0, m4b));
+            const __m128i vA1 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(tA0, 4), m4b));
+            const __m128i vA2 = _mm_shuffle_epi8(values, _mm_and_si128(tA1, m4b));
+            const __m128i vA3 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(tA1, 4), m4b));
+            const __m128i aA0 = _mm_sign_epi8(vA0, vA0), aA1 = _mm_sign_epi8(vA1, vA1);
+            const __m128i aA2 = _mm_sign_epi8(vA2, vA2), aA3 = _mm_sign_epi8(vA3, vA3);
+            const __m128i pA = _mm_add_epi32(
+                _mm_madd_epi16(_mm_maddubs_epi16(aA0, _mm_sign_epi8(ya0, vA0)), ones),
+                _mm_madd_epi16(_mm_maddubs_epi16(aA1, _mm_sign_epi8(ya1, vA1)), ones));
+            const __m128i qA = _mm_add_epi32(
+                _mm_madd_epi16(_mm_maddubs_epi16(aA2, _mm_sign_epi8(yb0, vA2)), ones),
+                _mm_madd_epi16(_mm_maddubs_epi16(aA3, _mm_sign_epi8(yb1, vA3)), ones));
+            accA = _mm256_add_ps(accA, _mm256_mul_ps(
+                _mm256_set_m128(_mm_set1_ps(h2f(u16(A1)) * yd[ib + 1]), _mm_set1_ps(h2f(u16(A0)) * yd[ib])),
+                _mm256_cvtepi32_ps(_mm256_castps_si256(_mm256_set_m128(_mm_castsi128_ps(qA), _mm_castsi128_ps(pA))))));
+            const __m128i vB0 = _mm_shuffle_epi8(values, _mm_and_si128(tB0, m4b));
+            const __m128i vB1 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(tB0, 4), m4b));
+            const __m128i vB2 = _mm_shuffle_epi8(values, _mm_and_si128(tB1, m4b));
+            const __m128i vB3 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(tB1, 4), m4b));
+            const __m128i aB0 = _mm_sign_epi8(vB0, vB0), aB1 = _mm_sign_epi8(vB1, vB1);
+            const __m128i aB2 = _mm_sign_epi8(vB2, vB2), aB3 = _mm_sign_epi8(vB3, vB3);
+            const __m128i pB = _mm_add_epi32(
+                _mm_madd_epi16(_mm_maddubs_epi16(aB0, _mm_sign_epi8(ya0, vB0)), ones),
+                _mm_madd_epi16(_mm_maddubs_epi16(aB1, _mm_sign_epi8(ya1, vB1)), ones));
+            const __m128i qB = _mm_add_epi32(
+                _mm_madd_epi16(_mm_maddubs_epi16(aB2, _mm_sign_epi8(yb0, vB2)), ones),
+                _mm_madd_epi16(_mm_maddubs_epi16(aB3, _mm_sign_epi8(yb1, vB3)), ones));
+            accB = _mm256_add_ps(accB, _mm256_mul_ps(
+                _mm256_set_m128(_mm_set1_ps(h2f(u16(B1)) * yd[ib + 1]), _mm_set1_ps(h2f(u16(B0)) * yd[ib])),
+                _mm256_cvtepi32_ps(_mm256_castps_si256(_mm256_set_m128(_mm_castsi128_ps(qB), _mm_castsi128_ps(pB))))));
+        }
+        out[0][r] = hsum4(_mm_add_ps(_mm256_castps256_ps128(accA), _mm256_extractf128_ps(accA, 1)));
+        out[0][r + 1] = hsum4(_mm_add_ps(_mm256_castps256_ps128(accB), _mm256_extractf128_ps(accB, 1)));
+    }
+    for (; r < r1; ++r) iq4nl_rows<1, false>(w, row_bytes, n, &y0, out, r, r + 1);
+}
+
 void iq128_down_rows_mode(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                           float* const* out, int r0, int r1, int mode) {
     const block_q8_0* y0 = (const block_q8_0*) hq[0];
     if (mode == 1 && type == 20 && nt == 1) { iq4nl_rows<1, true>(w, row_bytes, n, &y0, out, r0, r1); return; }
+    if (mode == 9 && type == 20 && nt == 1) { iq4nl_down_pair_nt1(w, row_bytes, n, &y0, out, r0, r1); return; }
     iq128_down_rows(type, w, row_bytes, n, hq, nt, out, r0, r1);
 }
 
@@ -974,6 +1112,10 @@ void iq128_down_rows(int type, const uint8_t* w, size_t row_bytes, int n, const 
     const block_q8_0* y[8];
     for (int t = 0; t < nt && t < 8; ++t) y[t] = (const block_q8_0*) hq[t];
     if (type == 20) {
+        // IQ4_NL down at one token runs two rows in flight sharing the activation loads (mode 9 shape): measured
+        // 24/24 samples positive, medians 1.058-1.066 across the four IQ4_NL rungs.  Other token counts keep the
+        // 4-token chunking, where one decode already feeds four tokens and there is nothing to share.
+        if (nt == 1) { iq4nl_down_pair_nt1(w, row_bytes, n, y, out, r0, r1); return; }
         for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
             switch (k) {
