@@ -32,6 +32,10 @@ void iq128_gu_rows_mode(int ggml_type, const uint8_t* blob, size_t gu_row, size_
 
 /// down formats with an AVX1 kernel: IQ4_NL (20), Q2_0 (42, the fork's type).  Activations: Q8_0 for both.
 bool iq128_down_supported(int ggml_type) noexcept;
+// measurement-only entry: mode 0 == iq128_down_rows, mode 1 = IQ4_NL one-token with |w| derived (pabsb).
+void iq128_down_rows_mode(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
+                          float* const* out, int r0, int r1, int mode);
+
 void iq128_down_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                      float* const* out, int r0, int r1);
 
