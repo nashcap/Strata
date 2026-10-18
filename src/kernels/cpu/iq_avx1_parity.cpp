@@ -584,8 +584,9 @@ void run_checks() {
                 std::vector<std::vector<float>> ffm(kMaxT, std::vector<float>(kFF));
                 float* ffmp[kMaxT];
                 for (int t = 0; t < kMaxT; ++t) ffmp[t] = ffm[t].data();
-                for (int mode : {0, 2, 3, 4, 5, 7}) {
+                for (int mode : {0, 2, 3, 4, 5, 7, 8}) {
                     if (mode == 4 && c.gu != 22) continue;   // the phased shapes read one format's layout
+                    if (mode == 8 && c.gu != 22) continue;
                     if (mode == 5 && c.gu != 21) continue;
                     if (mode == 7 && (c.gu != 21 && c.gu != 18)) continue;
                     if (mode == 6 && (c.gu != 22 || nt != 1)) continue;   // two-token shape: checked at nt=2 below
@@ -610,6 +611,15 @@ void run_checks() {
         // down
         for (int nt = 1; nt <= kMaxT; ++nt) {
             cpu::iq128_down_rows(c.dn, fx.blob.data() + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
+            if (nt == 1 && c.dn == 20) {   // the 2-row down shape against the shipped down path
+                std::vector<std::vector<float>> ot9(kMaxT, std::vector<float>(kH));
+                float* o9p[kMaxT];
+                for (int t = 0; t < kMaxT; ++t) o9p[t] = ot9[t].data();
+                cpu::iq128_down_rows_mode(c.dn, fx.blob.data() + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, o9p, 0, kH, 9);
+                char w9[96];
+                std::snprintf(w9, sizeof w9, "%s dn pair2 nt=1", c.name);
+                check(w9, ot9[0], out[0], true);
+            }
             if (nt == 1 && c.dn == 20) {   // the pabsb down shape against the shipped down path
                 std::vector<std::vector<float>> otv(kMaxT, std::vector<float>(kH));
                 float* o1p[kMaxT];
@@ -705,7 +715,22 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
             }
             const double ms_iq = ms_iq_gu + (ms_iq_dn = std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-                if (nt == 1 && c.dn == 20) {   // pabsb down vs shipped down
+                if (nt == 1 && c.dn == 20) {   // down variants vs shipped down
+                double bs9 = 1e30, bp9 = 1e30;
+                for (int rep = 0; rep < 7; ++rep) {
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_down_rows(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH);
+                    bs9 = std::min(bs9, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    t0 = Clock::now();
+                    for (int e = 0; e < nexp; ++e)
+                        cpu::iq128_down_rows_mode(c.dn, blob.data() + (size_t) e * per + fx.f.down_off, fx.f.d_row, kFF, hqp, nt, outp, 0, kH, 9);
+                    bp9 = std::min(bp9, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
+                std::printf("  %-16s nt=1  down pair2 %.3f vs shipped %.3f = %.3fx (min of 7 alternating)\n",
+                            c.name, bp9 / nexp, bs9 / nexp, bs9 / bp9);
+            }
+            if (nt == 1 && c.dn == 20) {   // pabsb down vs shipped down
                 double bs = 1e30, bp = 1e30;
                 for (int rep = 0; rep < 7; ++rep) {
                     t0 = Clock::now();
@@ -736,9 +761,10 @@ void run_bench(int mb, const std::vector<int>& nts) {
                             c.name, bs / nexp, bp / nexp, bs / bp);
             }
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {   // row pairing / hoist A/B
-            double b[8] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
+            double b[9] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
                 for (int rep = 0; rep < 5; ++rep)
-                    for (int mode = 0; mode < 8; ++mode) {
+                    for (int mode = 0; mode < 9; ++mode) {
+                        if (mode == 8 && c.gu != 22) continue;
                         if (mode == 4 && c.gu != 22) continue;
                         if (mode == 5 && c.gu != 21) continue;
                         if (mode == 6) continue;          // two-token shape, measured at nt=2
@@ -759,6 +785,9 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 if (c.gu == 21 || c.gu == 18)
                     std::printf("  %-16s nt=1  IQ3 phased-with-fold %.3f vs shipped %.3f = %.3fx (min of 5 alternating)\n",
                                 c.name, b[7] / nexp, b[1] / nexp, b[1] / b[7]);
+                if (c.gu == 22)
+                    std::printf("  %-16s nt=1  IQ2_S dual-stream %.3f vs shipped-phased %.3f = %.3fx (min of 5 alternating)\n",
+                                c.name, b[8] / nexp, b[4] / nexp, b[4] / b[8]);
             }
             double ms_rp_gu = 0, ms_iq_gu_best = 0, ms_rpu_gu = 0;
             const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
