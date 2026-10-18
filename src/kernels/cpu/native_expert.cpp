@@ -265,7 +265,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    // the older-CPU tier: IQ4_NL and Q2_0 down rows in 128-bit (ggml-cpu's dots for both are scalar here)
+    // The older-CPU tier: only what iq128_down_supported() admits - Q2_0 (42), where ggml-cpu has no x86 dot at
+    // all (4.2-4.7x).  IQ4_NL (20) falls through to ggml's hand-written __AVX__ dot: re-measured on an E5-2470 v2
+    // on 2026-10-18 at 0.27 vs 0.32 ms/expert at nt=1 (0.81-0.89x for the 128-bit kernel at nt=2 and 4), and an
+    // A/B of the two rungs in the engine was a wash (-1.0% pooled, 90% CI [-3.4,+1.4]) because the support
+    // function already made this choice.  See iq_avx1.cpp:538.
     static const bool avx1 = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr;
     if (avx1 && iq128_down_supported(f.d_type)) {
         iq128_down_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);

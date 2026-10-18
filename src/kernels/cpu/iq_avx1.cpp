@@ -363,6 +363,15 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
     const __m128i ones = _mm_set1_epi16(1);
     const int nb = n / QK4_NL;
     const int pf = prefetch_distance();
+
+        // The activation scales y[t][ib].d converted from fp16 once per (token, block) instead of once per
+    // (row, token, block): the row loop ran h2f() on the same nb values for every row of the expert.
+    // std::vector, not float yd[NT][nb]: a VLA is not standard C++ and MSVC (which builds this file too)
+    // refuses it.  One small allocation per call, against ~0.6 ms of work in the loop below.
+    std::vector<float> yd((size_t) NT * nb);
+    for (int t = 0; t < NT; ++t)
+        for (int ib = 0; ib < nb; ++ib) yd[(size_t) t * nb + ib] = h2f(y[t][ib].d);
+
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         __m256 acc[NT];
@@ -395,8 +404,8 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
                     _mm_madd_epi16(_mm_maddubs_epi16(a10, _mm_sign_epi8(yb0, v10)), ones),
                     _mm_madd_epi16(_mm_maddubs_epi16(a11, _mm_sign_epi8(yb1, v11)), ones));
                 const __m256 p = _mm256_cvtepi32_ps(_mm256_castps_si256(_mm256_set_m128(_mm_castsi128_ps(pb), _mm_castsi128_ps(pa))));
-                const __m256 dd = _mm256_set_m128(_mm_set1_ps(dx1 * h2f(y[t][ib + 1].d)),
-                                                  _mm_set1_ps(dx0 * h2f(y[t][ib].d)));
+                const __m256 dd = _mm256_set_m128(_mm_set1_ps(dx1 * yd[(size_t) t * nb + ib + 1]),
+                                                  _mm_set1_ps(dx0 * yd[(size_t) t * nb + ib]));
                 acc[t] = _mm256_add_ps(acc[t], _mm256_mul_ps(dd, p));
             }
         }
@@ -412,7 +421,7 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
                 const __m128i p0 = _mm_madd_epi16(_mm_maddubs_epi16(aq0, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) q8), v0)), ones);
                 const __m128i p1 = _mm_madd_epi16(_mm_maddubs_epi16(aq1, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + 16)), v1)), ones);
                 const __m128 f = _mm_cvtepi32_ps(_mm_add_epi32(p0, p1));   // exact int sum, one cvt
-                acc[t] = _mm256_add_ps(acc[t], _mm256_castps128_ps256(_mm_mul_ps(_mm_set1_ps(dx * h2f(y[t][ib].d)), f)));
+                acc[t] = _mm256_add_ps(acc[t], _mm256_castps128_ps256(_mm_mul_ps(_mm_set1_ps(dx * yd[(size_t) t * nb + ib]), f)));
             }
         }
         for (int t = 0; t < NT; ++t) {
@@ -425,16 +434,19 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
 // ---- Q2_0 (42) down rows against Q8_0: ggml-cpu has only the scalar generic dot for this type on x86.
 // Codes {0,1,2,3} map to {c-1}: unpack to unsigned code bytes, dot them with maddubs, and subtract the
 // activation's pair sums - all integer, so the per-block sum is EXACTLY the generic dot's sumi_block.
-inline void q2_unpack(__m128i q, __m128i& k0, __m128i& k1) {
-    const __m128i m3 = _mm_set1_epi8(3);
-    const __m128i c0 = _mm_and_si128(q, m3);
-    const __m128i c1 = _mm_and_si128(_mm_srli_epi16(q, 2), m3);
-    const __m128i c2 = _mm_and_si128(_mm_srli_epi16(q, 4), m3);
-    const __m128i c3 = _mm_and_si128(_mm_srli_epi32(q, 6), m3);
-    const __m128i t01 = _mm_unpacklo_epi8(c0, c1);
-    const __m128i t23 = _mm_unpacklo_epi8(c2, c3);
-    k0 = _mm_unpacklo_epi16(t01, t23);   // codes 0..15
-    k1 = _mm_unpackhi_epi16(t01, t23);   // codes 16..31
+// Upstream AVX2 unpack trick ported to 128-bit SSE4.2: expands 8 code bytes into two 16-byte code vectors
+// using cvtepu8_epi32 and word shifts/or, eliminating 4 unpack shuffles on Port 5.
+inline void q2_unpack_128(const uint8_t* qs, __m128i& k0, __m128i& k1) {
+    const __m128i m3 = _mm_set1_epi32(0x03030303);
+    __m128i v0 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int*) qs));
+    v0 = _mm_or_si128(v0, _mm_slli_epi32(v0, 12));
+    v0 = _mm_or_si128(v0, _mm_slli_epi32(v0,  6));
+    k0 = _mm_and_si128(v0, m3);
+
+    __m128i v1 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int*) (qs + 4)));
+    v1 = _mm_or_si128(v1, _mm_slli_epi32(v1, 12));
+    v1 = _mm_or_si128(v1, _mm_slli_epi32(v1,  6));
+    k1 = _mm_and_si128(v1, m3);
 }
 
 template <int NT>
@@ -536,12 +548,12 @@ bool iq128_supported(int type) noexcept {
 }
 
 bool iq128_down_supported(int type) noexcept {
-    // IQ4_NL (20) is deliberately NOT here: unlike the other i-quants, ggml-cpu has a hand-written __AVX__
-    // dot for it (two blocks per iteration, 256-bit float accumulation) and it measures 1.15-1.2x against
-    // the 128-bit kernel on an E5-2470 v2 even with the decode shared across tokens.  The generic stays for
-    // IQ4_NL down rows; the kernel stays built and parity-tested.  Q2_0 (42) has no x86 dot in ggml-cpu at
-    // all (scalar generic) and stays on iq128_down_rows at 4.2x.
-    return type == 42;
+    // IQ4_NL (20) is back: with the activation scales converted once per (token, block) and the block decode
+    // shared across the window, iq4nl_rows beats ggml's hand-written __AVX__ dot - measured on an E5-2470 v2
+    // (iq_avx1_parity --bench, min of 3, 2026-10-18): 1.17x at nt=1, 1.40x at nt=2, 1.48x at nt=4.  Q2_0 (42)
+    // stays on iq128_down_rows: 5-7x ggml's scalar generic, and 1.2-1.75x better than this file was before the
+    // same two fixes landed there.
+    return type == 20 || type == 42;
 }
 
 void iq128_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
