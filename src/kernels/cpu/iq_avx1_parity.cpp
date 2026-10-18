@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -132,21 +133,29 @@ int failures = 0;
 // kernel at nt and at nt=1) plus rel <= 1e-5 against ggml-cpu - they do not say a new kernel agrees with the
 // kernel it replaces to the bit, and the seeds are fixed, so two builds printing the same fingerprint do.
 uint64_t row_fp = 1469598103934665603ull;
-void fp_mix(const char* s, const std::vector<float>& v) {
-    for (const char* p = s; *p; ++p) { row_fp ^= (unsigned char) *p; row_fp *= 1099511628211ull; }
+std::map<std::string, uint64_t> rung_fp;   // per format+side, so a change can be pinned to one rung
+std::map<std::string, std::pair<uint64_t, double>> vs_ggml;   // per rung: rows differing bitwise, worst rel
+uint64_t fp_of(const char* s, const std::vector<float>& v) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = s; *p; ++p) { h ^= (unsigned char) *p; h *= 1099511628211ull; }
     for (float f : v) {
         uint32_t b;
         std::memcpy(&b, &f, sizeof b);
-        row_fp ^= b & 0xFF; row_fp *= 1099511628211ull;
-        row_fp ^= (b >> 8) & 0xFF; row_fp *= 1099511628211ull;
-        row_fp ^= (b >> 16) & 0xFF; row_fp *= 1099511628211ull;
-        row_fp ^= (b >> 24) & 0xFF; row_fp *= 1099511628211ull;
+        h ^= b & 0xFF; h *= 1099511628211ull;
+        h ^= (b >> 8) & 0xFF; h *= 1099511628211ull;
+        h ^= (b >> 16) & 0xFF; h *= 1099511628211ull;
+        h ^= (b >> 24) & 0xFF; h *= 1099511628211ull;
     }
+    return h;
 }
 
 void check(const char* what, const std::vector<float>& got, const std::vector<float>& ref, bool exact) {
-    fp_mix(what, got);
-    fp_mix(what, ref);
+    const uint64_t h = fp_of(what, got);
+    row_fp ^= h; row_fp *= 1099511628211ull;
+    std::string key = std::string(what);
+    size_t sp = key.find(" nt=");
+    if (sp != std::string::npos) key.erase(sp);
+    rung_fp[key] ^= h;
     if (exact) {   // bit-exact (iq_avx2_parity's rows_differ)
         size_t d = 0;
         for (size_t i = 0; i < ref.size(); ++i) d += std::memcmp(&got[i], &ref[i], sizeof(float)) != 0;
@@ -160,6 +169,13 @@ void check(const char* what, const std::vector<float>& got, const std::vector<fl
         den += std::fabs((double) ref[i]);
     }
     const double r = num / (den + 1e-30);
+    size_t diff = 0;
+    for (size_t i = 0; i < ref.size(); ++i) diff += std::memcmp(&got[i], &ref[i], sizeof(float)) != 0;
+    std::string k = std::string(what);
+    size_t kp = k.find(" nt=");
+    if (kp != std::string::npos) k.erase(kp);
+    vs_ggml[k].first += diff;
+    if (r > vs_ggml[k].second) vs_ggml[k].second = r;
     if (!(r <= 1e-5)) { std::printf("  FAIL %s: rel %.3e > 1e-5 vs ggml-cpu\n", what, r); ++failures; }
 }
 
@@ -330,6 +346,8 @@ int main(int argc, char** argv) {
     std::printf("iq_avx1_parity: %s\n", cpu::cpu_avx1_ok() ? "AVX1 kernels checked (128-bit lanes)" : "");
     if (bench) { run_bench(mb, nts); return failures != 0; }
     run_checks();
+    for (const auto& kv : vs_ggml) std::printf("iq_avx1_parity: vs ggml-cpu %-24s %6llu rows differ bitwise, worst rel %.3e\n", kv.first.c_str(), (unsigned long long) kv.second.first, kv.second.second);
+    for (const auto& kv : rung_fp) std::printf("iq_avx1_parity: rung fingerprint %-22s %016llx\n", kv.first.c_str(), (unsigned long long) kv.second);
     std::printf("iq_avx1_parity: row fingerprint %016llx\n", (unsigned long long) row_fp);
     std::printf(failures ? "iq_avx1_parity: %d FAILURES\n" : "iq_avx1_parity: all rows match\n", failures);
     return failures != 0;
