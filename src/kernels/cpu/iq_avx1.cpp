@@ -876,7 +876,12 @@ inline void gu_rows_iq3s_pipe(const uint8_t* blob, size_t gu_row, size_t up_off,
 }
 
 
-// MODES 17 / 18 / 19 (round 10, report-10 proposals 1-3).  Round 9 showed the loop waits on the latency chain in
+// MODES 17 / 18 / 19 (round 10, report-10 proposals 1-3).  MEASURED DEAD, NOT USED (clean, service stopped,
+// n=12 each, all three bit-exact): 17 = 0.944 (0/12), 19 = 0.925 (0/12), 18 = 1.003 (7/12) - and 18 is measured
+// against the same pre-phasing baseline as the shipped mode 13, which reads 1.040 (12/12) in the same run, so the
+// codebook pre-decode is ~3.6% slower than what production already runs.  The predicted +3.5-6.0% never appeared:
+// the 5-cycle codebook L1 load is NOT the unhidden latency in front of vpmaddubsw.  Do not re-propose moving loads
+// earlier; the remaining cycles live in the vector assembly and the pmaddubsw -> pmaddwd -> int32 add chain.  Round 9 showed the loop waits on the latency chain in
 // front of vpmaddubsw, and pre-issuing the index BUILD paid +2.5% on IQ2_S.  These go one stage further: they
 // pre-decode the CODEBOOK loads (the 5-cycle L1 hit on iq3xxs_grid / iq2s_grid / iq3s_grid) across the sub-block
 // boundary, so the grid vectors for the next phase are already in registers when its multiply is issued.  Each is
