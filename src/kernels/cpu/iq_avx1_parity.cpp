@@ -584,11 +584,15 @@ void run_checks() {
                 std::vector<std::vector<float>> ffm(kMaxT, std::vector<float>(kFF));
                 float* ffmp[kMaxT];
                 for (int t = 0; t < kMaxT; ++t) ffmp[t] = ffm[t].data();
-                for (int mode : {0, 2, 3, 4, 5, 7, 8}) {
+                for (int mode : {0, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15, 16}) {
                     if (mode == 4 && c.gu != 22) continue;   // the phased shapes read one format's layout
                     if (mode == 8 && c.gu != 22) continue;
                     if (mode == 5 && c.gu != 21) continue;
                     if (mode == 7 && (c.gu != 21 && c.gu != 18)) continue;
+                    if ((mode == 10 || mode == 11 || mode == 12) && c.gu != 18 && c.gu != 21 && c.gu != 22) continue;
+                    if ((mode == 13 || mode == 15) && c.gu != 22) continue;   // IQ2_S-only shapes
+                    if (mode == 14 && c.gu != 21) continue;                     // the dedup shape reads IQ3_S's layout
+                    if (mode == 16 && c.gu != 21) continue;                     // index pre-issue is the IQ3_S index path
                     if (mode == 6 && (c.gu != 22 || nt != 1)) continue;   // two-token shape: checked at nt=2 below
                     cpu::iq128_gu_rows_mode(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffmp, 0, kFF, mode);
                     char what[96];
@@ -761,15 +765,19 @@ void run_bench(int mb, const std::vector<int>& nts) {
                             c.name, bs / nexp, bp / nexp, bs / bp);
             }
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {   // row pairing / hoist A/B
-            double b[9] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
+            double b[17] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
                 for (int rep = 0; rep < 5; ++rep)
-                    for (int mode = 0; mode < 9; ++mode) {
+                    for (int mode = 0; mode < 17; ++mode) {
                         if (mode == 8 && c.gu != 22) continue;
                         if (mode == 4 && c.gu != 22) continue;
                         if (mode == 5 && c.gu != 21) continue;
                         if (mode == 6) continue;          // two-token shape, measured at nt=2
                     if (mode == 7 && (c.gu != 21 && c.gu != 18)) continue;
-                    if (mode == 6 && (c.gu != 22 || nt != 1)) continue;   // two-token shape: checked at nt=2 below   // each phased shape reads one format's layout
+                    if (mode == 6) continue;   // two-token shape: measured at nt=2
+                    if ((mode == 10 || mode == 11 || mode == 12) && c.gu != 18 && c.gu != 21 && c.gu != 22) continue;
+                        if ((mode == 13 || mode == 15) && c.gu != 22) continue;
+                        if (mode == 14 && c.gu != 21) continue;
+                        if (mode == 16 && c.gu != 21) continue;
                         t0 = Clock::now();
                         for (int e = 0; e < nexp; ++e)
                             cpu::iq128_gu_rows_mode(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off,
@@ -788,6 +796,18 @@ void run_bench(int mb, const std::vector<int>& nts) {
                 if (c.gu == 22)
                     std::printf("  %-16s nt=1  IQ2_S dual-stream %.3f vs shipped-phased %.3f = %.3fx (min of 5 alternating)\n",
                                 c.name, b[8] / nexp, b[4] / nexp, b[4] / b[8]);
+                if (c.gu == 18 || c.gu == 21 || c.gu == 22) {
+                    const double ship = (c.gu == 22) ? b[4] : b[7];   // the shipped path for that format
+                    std::printf("  %-16s nt=1  packed-loads %.3f (%.3fx) | split-acc %.3f (%.3fx) | both %.3f (%.3fx)  vs shipped %.3f (min of 5 alternating)\n",
+                                c.name, b[10] / nexp, ship / b[10], b[11] / nexp, ship / b[11], b[12] / nexp, ship / b[12], ship / nexp);
+                    // one line per candidate: a shared multi-column line shifts its values when modes are added
+                    for (int m : {13, 14, 15, 16})
+                        if (b[m] < 1e29)
+                            std::printf("  %-16s nt=1  mode=%-2d %s %.3f (%.3fx) vs shipped %.3f (min of 5 alternating)\n",
+                                        c.name, m, m == 13 ? "iq2s-index-pipeline" : m == 14 ? "iq3s-dedup-grid"
+                                                             : m == 15 ? "iq2s-scalar-index" : "iq3s-index-pipeline",
+                                        b[m] / nexp, ship / b[m], ship / nexp);
+                }
             }
             double ms_rp_gu = 0, ms_iq_gu_best = 0, ms_rpu_gu = 0;
             const size_t rphalf = (size_t) kFF * (size_t) (kH / QK_K);
