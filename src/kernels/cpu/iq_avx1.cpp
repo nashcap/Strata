@@ -1722,7 +1722,7 @@ void iq128_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
     // mode is chosen per type, not globally, and every mode writes bit for bit the same rows.
     switch (type) {
         case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 7); break;   // phased, fold kept
-        case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 7); break;   // phased, fold kept
+        case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 16); break;  // phased, fold kept, index build one sub-half early.  Re-measured on the 0.2.0 base: +3.85% (7/8 samples, 4 trials x min-of-5 alternating, both IQ3_S rungs); it was only +1.4% on the 0.1.45 base, which is why mode 13 shipped for IQ2_S and this waited.
         case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 13); break;  // phased 16-value decode, index build one sub-block early (+2.5% at nt=1, 12/12 clean samples)
         case 23: gu_rows_nt_mode<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
         default: break;
