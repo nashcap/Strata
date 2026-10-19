@@ -795,20 +795,25 @@ void run_bench(int mb, const std::vector<int>& nts) {
                                                     kH, actp, nt, ffp, 0, kFF, mode);
                         b[mode] = std::min(b[mode], std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     }
-                std::printf("  %-16s nt=1  pairing old %.3f | pair+hoist %.3f (%.3fx) | hoist %.3f (%.3fx) | R=4 %.3f (%.3fx) | phased16 %.3f (%.3fx vs old, %.3fx vs shipped) min of 5 alternating\n",
+                std::printf("  %-16s nt=1  pairing old %.3f | pair+hoist %.3f (%.3fx) | hoist %.3f (%.3fx) | R=4 %.3f (%.3fx) | phased16 %.3f (%.3fx vs old, %.3fx vs pre-campaign pairing) min of 5 alternating\n",
                             c.name, b[0] / nexp, b[1] / nexp, b[0] / b[1], b[2] / nexp, b[0] / b[2], b[3] / nexp, b[0] / b[3],
                             b[4] / nexp, b[0] / b[4], b[1] / b[4]);
                 if (c.gu == 21)
-                    std::printf("  %-16s nt=1  IQ3_S phased-unfolded %.3f vs shipped %.3f = %.3fx (min of 5 alternating)\n",
+                    std::printf("  %-16s nt=1  IQ3_S phased-unfolded %.3f vs pre-campaign pairing %.3f = %.3fx (min of 5 alternating)\n",
                                 c.name, b[5] / nexp, b[1] / nexp, b[1] / b[5]);
                 if (c.gu == 21 || c.gu == 18)
-                    std::printf("  %-16s nt=1  IQ3 phased-with-fold %.3f vs shipped %.3f = %.3fx (min of 5 alternating)\n",
+                    std::printf("  %-16s nt=1  IQ3 phased-with-fold %.3f vs pre-campaign pairing %.3f = %.3fx (min of 5 alternating)\n",
                                 c.name, b[7] / nexp, b[1] / nexp, b[1] / b[7]);
                 if (c.gu == 22)
-                    std::printf("  %-16s nt=1  IQ2_S dual-stream %.3f vs shipped-phased %.3f = %.3fx (min of 5 alternating)\n",
-                                c.name, b[8] / nexp, b[4] / nexp, b[4] / b[8]);
+                    std::printf("  %-16s nt=1  IQ2_S dual-stream %.3f vs shipped mode 13 %.3f = %.3fx (min of 5 alternating)\n",
+                                c.name, b[8] / nexp, b[13] / nexp, b[13] / b[8]);
                 if (c.gu == 18 || c.gu == 21 || c.gu == 22) {
-                    const double ship = (c.gu == 22) ? b[4] : b[7];   // the shipped path for that format
+                    // 'shipped' must be the path production actually dispatches, or every candidate on this line is
+                    // measured against the wrong baseline: it used to read (c.gu == 22) ? b[4] : b[7], which went
+                    // stale twice - mode 13 for IQ2_S (+3.7% over b[4]) and mode 16 for IQ3_S (+3.9% over b[7]).
+                    // An IQ2_S candidate measured against b[4] looks promotable when it is really 3.7% behind.
+                    // (b[1] in the older lines above stays what it always was: the pre-campaign shipped pairing.)
+                    const double ship = (c.gu == 22) ? b[13] : ((c.gu == 21) ? b[16] : b[7]);
                     std::printf("  %-16s nt=1  packed-loads %.3f (%.3fx) | split-acc %.3f (%.3fx) | both %.3f (%.3fx)  vs shipped %.3f (min of 5 alternating)\n",
                                 c.name, b[10] / nexp, ship / b[10], b[11] / nexp, ship / b[11], b[12] / nexp, ship / b[12], ship / nexp);
                     // one line per candidate: a shared multi-column line shifts its values when modes are added
@@ -816,7 +821,7 @@ void run_bench(int mb, const std::vector<int>& nts) {
                         if (b[m] < 1e29)
                             std::printf("  %-16s nt=1  mode=%-2d %s %.3f (%.3fx) vs shipped %.3f (min of 5 alternating)\n",
                                         c.name, m, m == 13 ? "iq2s-index-pipeline" : m == 14 ? "iq3s-dedup-grid"
-                                                             : m == 15 ? "iq2s-scalar-index" : m == 16 ? "iq3s-index-pipeline"
+                                                             : m == 15 ? "iq2s-scalar-index" : m == 16 ? (c.gu == 18 ? "iq3xxs-index-pipe" : "iq3s-index-pipeline")
                                                           : m == 17 ? "iq3xxs-codebook-pipe" : m == 18 ? "iq2s-codebook-pipe" : m == 19 ? "iq3s-dedup-pipe" : "iq2s-affine-codebook",
                                         b[m] / nexp, ship / b[m], ship / nexp);
                 }
