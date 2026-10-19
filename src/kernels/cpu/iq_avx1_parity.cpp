@@ -592,7 +592,7 @@ void run_checks() {
                     if ((mode == 10 || mode == 11 || mode == 12) && c.gu != 18 && c.gu != 21 && c.gu != 22) continue;
                     if ((mode == 13 || mode == 15) && c.gu != 22) continue;   // IQ2_S-only shapes
                     if (mode == 14 && c.gu != 21) continue;                     // the dedup shape reads IQ3_S's layout
-                    if (mode == 16 && c.gu != 21) continue;                     // index pre-issue is the IQ3_S index path
+                    if (mode == 16 && c.gu != 21 && c.gu != 18) continue;   // index pre-issue: IQ3_S, and IQ3_XXS from round 13
                     if (mode == 17 && c.gu != 18) continue;                     // the round-10 shapes are format-specific
                     if (mode == 18 && c.gu != 22) continue;
                     if (mode == 19 && c.gu != 21) continue;
@@ -769,6 +769,9 @@ void run_bench(int mb, const std::vector<int>& nts) {
                             c.name, bs / nexp, bp / nexp, bs / bp);
             }
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {   // row pairing / hoist A/B
+                // NOTE: the mode-format guards below are a second copy of the list in the parity pass (~line 590).
+                // They drift: mode 16 was opened to IQ3_XXS in the parity pass and silently stayed IQ3_S-only here,
+                // so the first bench run printed no iq3_xxs mode=16 line at all.  Edit both when adding a mode.
             double b[21] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
                 for (int rep = 0; rep < 5; ++rep)
                     for (int mode = 0; mode < 21; ++mode) {
@@ -781,7 +784,7 @@ void run_bench(int mb, const std::vector<int>& nts) {
                     if ((mode == 10 || mode == 11 || mode == 12) && c.gu != 18 && c.gu != 21 && c.gu != 22) continue;
                         if ((mode == 13 || mode == 15) && c.gu != 22) continue;
                         if (mode == 14 && c.gu != 21) continue;
-                        if (mode == 16 && c.gu != 21) continue;
+                        if (mode == 16 && c.gu != 21 && c.gu != 18) continue;
                         if (mode == 17 && c.gu != 18) continue;
                         if (mode == 18 && c.gu != 22) continue;
                         if (mode == 19 && c.gu != 21) continue;
