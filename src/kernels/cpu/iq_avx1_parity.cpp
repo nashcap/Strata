@@ -584,7 +584,7 @@ void run_checks() {
                 std::vector<std::vector<float>> ffm(kMaxT, std::vector<float>(kFF));
                 float* ffmp[kMaxT];
                 for (int t = 0; t < kMaxT; ++t) ffmp[t] = ffm[t].data();
-                for (int mode : {0, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}) {
+                for (int mode : {0, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}) {
                     if (mode == 4 && c.gu != 22) continue;   // the phased shapes read one format's layout
                     if (mode == 8 && c.gu != 22) continue;
                     if (mode == 5 && c.gu != 21) continue;
@@ -596,6 +596,7 @@ void run_checks() {
                     if (mode == 17 && c.gu != 18) continue;                     // the round-10 shapes are format-specific
                     if (mode == 18 && c.gu != 22) continue;
                     if (mode == 19 && c.gu != 21) continue;
+                    if (mode == 20 && c.gu != 22) continue;   // the affine-codebook shape reads IQ2_S's layout
                     if (mode == 6 && (c.gu != 22 || nt != 1)) continue;   // two-token shape: checked at nt=2 below
                     cpu::iq128_gu_rows_mode(c.gu, fx.blob.data(), fx.f.gu_row, fx.f.up_off, kH, actp, nt, ffmp, 0, kFF, mode);
                     char what[96];
@@ -768,9 +769,9 @@ void run_bench(int mb, const std::vector<int>& nts) {
                             c.name, bs / nexp, bp / nexp, bs / bp);
             }
             if (nt == 1 && (c.gu == 18 || c.gu == 21 || c.gu == 22 || c.gu == 23)) {   // row pairing / hoist A/B
-            double b[20] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
+            double b[21] = {1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30};
                 for (int rep = 0; rep < 5; ++rep)
-                    for (int mode = 0; mode < 20; ++mode) {
+                    for (int mode = 0; mode < 21; ++mode) {
                         if (mode == 8 && c.gu != 22) continue;
                         if (mode == 4 && c.gu != 22) continue;
                         if (mode == 5 && c.gu != 21) continue;
@@ -784,6 +785,7 @@ void run_bench(int mb, const std::vector<int>& nts) {
                         if (mode == 17 && c.gu != 18) continue;
                         if (mode == 18 && c.gu != 22) continue;
                         if (mode == 19 && c.gu != 21) continue;
+                        if (mode == 20 && c.gu != 22) continue;   // the affine-codebook shape reads IQ2_S's layout
                         t0 = Clock::now();
                         for (int e = 0; e < nexp; ++e)
                             cpu::iq128_gu_rows_mode(c.gu, blob.data() + (size_t) e * per, fx.f.gu_row, fx.f.up_off,
@@ -807,12 +809,12 @@ void run_bench(int mb, const std::vector<int>& nts) {
                     std::printf("  %-16s nt=1  packed-loads %.3f (%.3fx) | split-acc %.3f (%.3fx) | both %.3f (%.3fx)  vs shipped %.3f (min of 5 alternating)\n",
                                 c.name, b[10] / nexp, ship / b[10], b[11] / nexp, ship / b[11], b[12] / nexp, ship / b[12], ship / nexp);
                     // one line per candidate: a shared multi-column line shifts its values when modes are added
-                    for (int m : {13, 14, 15, 16, 17, 18, 19})
+                    for (int m : {13, 14, 15, 16, 17, 18, 19, 20})
                         if (b[m] < 1e29)
                             std::printf("  %-16s nt=1  mode=%-2d %s %.3f (%.3fx) vs shipped %.3f (min of 5 alternating)\n",
                                         c.name, m, m == 13 ? "iq2s-index-pipeline" : m == 14 ? "iq3s-dedup-grid"
                                                              : m == 15 ? "iq2s-scalar-index" : m == 16 ? "iq3s-index-pipeline"
-                                                          : m == 17 ? "iq3xxs-codebook-pipe" : m == 18 ? "iq2s-codebook-pipe" : "iq3s-dedup-pipe",
+                                                          : m == 17 ? "iq3xxs-codebook-pipe" : m == 18 ? "iq2s-codebook-pipe" : m == 19 ? "iq3s-dedup-pipe" : "iq2s-affine-codebook",
                                         b[m] / nexp, ship / b[m], ship / nexp);
                 }
             }

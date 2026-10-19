@@ -1122,6 +1122,121 @@ static inline __m128i iq2s_gr2(const uint8_t* q, uint64_t hi, int which) {
     return _mm_set_epi64x(b, a);
 }
 
+// MODE 20 (measurement): the codebook replaced by its OWN ARITHMETIC.  New fact: every byte of iq2s_grid is an
+// EXACT affine function of the 10 index bits - byte_k(i) = (K_k + sum_i c_ki * bit_i(i)) >> 9 for all 1024 entries,
+// every byte position, zero error (verified at first use below; the shape falls back to the table if it ever fails).
+// The same holds for iq3xxs_grid and iq3s_grid.  So the 8 KB grid table carries no information: it is arithmetic we
+// pay a load for.  No 3-bit shortcut exists (every subset searched), so the arithmetic is carried as two 5-bit half
+// tables (2 KB total, permanently L1-hot) plus add, exact >>9 and two packs per magnitude group.
+// This is NOT fewer uops - it is more.  The question it asks is the one the stall census makes interesting: does
+// taking the random 8 KB grid load off ports 2/3 (which have spare capacity) and the vpextrw/vpinsrq assembly off
+// ports 0/5 pay for the extra ALU on ports 0/1, which are the saturated ones?  Census says no.  Measure it.
+// MEASURED, contended box, n=6, bit-exact: 0.46-0.49x - the arithmetic form costs TWICE the time of the table form
+// (1.08-1.20 ms/expert vs 0.49-0.54).  The reason is structural, not tuning: the partial sums need 15-bit lanes
+// (coefficients reach 442, numerators 512*43) while pmaddubsw needs 8-bit lanes, so the decode must widen to int32,
+// do 4 loads + 4 adds + 4 shifts, then narrow through two packus - and packus is port 5, srai is port 0, both the
+// saturated ports.  The table gives the same bytes in one load plus a set_epi64x.  On this core the LOOKUP is not an
+// approximation of the arithmetic, it is a 2.1x faster expression of it.  Do not retry the affine decode in any form.
+struct Q2Affine {
+    alignas(16) int32_t lo[2][32][4], hi[2][32][4];
+    bool ok;
+};
+static const Q2Affine& q2aff() {
+    static Q2Affine t{};
+    static const bool init = [&] {
+        int K[8], C[8][10];
+        for (int k = 0; k < 8; ++k) {
+            K[k] = 512 * (int) ((iq2s_grid[0] >> (8 * k)) & 0xFF);
+            for (int i = 0; i < 10; ++i)
+                C[k][i] = (int) ((iq2s_grid[1u << i] >> (8 * k)) & 0xFF) - (int) ((iq2s_grid[0] >> (8 * k)) & 0xFF);
+        }
+        t.ok = true;
+        for (int idx = 0; idx < 1024 && t.ok; ++idx)
+            for (int k = 0; k < 8; ++k) {
+                int v = K[k];
+                for (int i = 0; i < 10; ++i) if ((idx >> i) & 1) v += C[k][i];
+                if (v != 512 * (int) ((iq2s_grid[idx] >> (8 * k)) & 0xFF)) { t.ok = false; break; }
+            }
+        for (int k = 0; k < 8; ++k)
+            for (int h = 0; h < 32; ++h) {
+                int a = K[k], b = 0;
+                for (int i = 0; i < 5; ++i) if ((h >> i) & 1) a += C[k][i];
+                for (int i = 5; i < 10; ++i) if ((h >> (i - 5)) & 1) b += C[k][i];
+                t.lo[k / 4][h][k % 4] = a;
+                t.hi[k / 4][h][k % 4] = b;
+            }
+        return true;
+    }();
+    (void) init;
+    return t;
+}
+
+static inline void iq2s_dec16_aff(__m128i idx, const uint8_t* sp, uint8_t sb, int which,
+                                  __m128i& g, __m128i& s, __m128i& c) {
+    const Q2Affine& T = q2aff();
+    if (!T.ok) { iq2s_dec16(idx, sp, sb, which, g, s, c); return; }
+    const int i0 = _mm_extract_epi16(idx, 2 * which), i1 = _mm_extract_epi16(idx, 2 * which + 1);
+    const __m128i a = _mm_srai_epi32(_mm_add_epi32(_mm_load_si128((const __m128i*) T.lo[0][i0 & 31]),
+                                                   _mm_load_si128((const __m128i*) T.hi[0][i0 >> 5])), 9);
+    const __m128i b = _mm_srai_epi32(_mm_add_epi32(_mm_load_si128((const __m128i*) T.lo[1][i0 & 31]),
+                                                   _mm_load_si128((const __m128i*) T.hi[1][i0 >> 5])), 9);
+    const __m128i d = _mm_srai_epi32(_mm_add_epi32(_mm_load_si128((const __m128i*) T.lo[0][i1 & 31]),
+                                                   _mm_load_si128((const __m128i*) T.hi[0][i1 >> 5])), 9);
+    const __m128i e = _mm_srai_epi32(_mm_add_epi32(_mm_load_si128((const __m128i*) T.lo[1][i1 & 31]),
+                                                   _mm_load_si128((const __m128i*) T.hi[1][i1 >> 5])), 9);
+    g = _mm_packus_epi16(_mm_packus_epi32(a, b), _mm_packus_epi32(d, e));   // mag 0..7 then 8..15, as set_epi64x gives
+    s = _mm_set_epi64x((long long) sign8.v[sp[1]], (long long) sign8.v[sp[0]]);
+    c = _mm_load_si128((const __m128i*) kscale16.v[which ? (sb >> 4) : (sb & 15)]);
+}
+
+// the shipped mode-13 IQ2_S shape with the grid lookup swapped for its affine arithmetic; all else identical
+template <int TY>
+inline void gu_rows_iq2s_aff(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                             float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    const int pf = prefetch_distance();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            rows_ahead(gb, pf); rows_ahead(ub, pf);
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag0 = _mm_setzero_si128(), ag1 = _mm_setzero_si128();
+            __m128i au0 = _mm_setzero_si128(), au1 = _mm_setzero_si128();
+            __m128i ig = grid_idx(gb + 2, hi_spread.iq2s[gb[66]]);
+            __m128i iu = grid_idx(ub + 2, hi_spread.iq2s[ub[66]]);
+            for (int h = 0; h < 8; ++h) {
+                const int off = 32 * h;
+                const uint8_t* spg = gb + 34 + 4 * h;
+                const uint8_t* spu = ub + 34 + 4 * h;
+                const uint8_t sbg = gb[74 + h], sbu = ub[74 + h];
+                const __m128i yv0 = _mm_loadu_si128((const __m128i*) (q8 + off));
+                __m128i g, s, c;
+                iq2s_dec16_aff(ig, spg, sbg, 0, g, s, c); ag0 = madd_add(ag0, g, s, yv0, c);
+                iq2s_dec16_aff(iu, spu, sbu, 0, g, s, c); au0 = madd_add(au0, g, s, yv0, c);
+                const __m128i yv1 = _mm_loadu_si128((const __m128i*) (q8 + off + 16));
+                iq2s_dec16_aff(ig, spg, sbg, 1, g, s, c); ag1 = madd_add(ag1, g, s, yv1, c);
+                iq2s_dec16_aff(iu, spu, sbu, 1, g, s, c); au1 = madd_add(au1, g, s, yv1, c);
+                if (h + 1 < 8) {
+                    ig = grid_idx(gb + 2 + 4 * (h + 1), hi_spread.iq2s[gb[66 + h + 1]]);
+                    iu = grid_idx(ub + 2 + 4 * (h + 1), hi_spread.iq2s[ub[66 + h + 1]]);
+                }
+            }
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(ag0, ag1))));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(au0, au1))));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
 template <int TY>
 inline void gu_rows_iq2s_scalar(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                                 float* const* ff, int r0, int r1) {
@@ -1309,6 +1424,11 @@ void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, 
             case 11:   // split accumulator chain (SP)
                 if (TY == 18 || TY == 21) gu_rows_phased32<TY, false, true>(blob, gu_row, up_off, n, act, ff, r0, r1);
                 else if (TY == 22) gu_rows_phased33<TY, false, true>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                return;
+            case 20:   // affine codebook arithmetic in place of the grid table (IQ2_S)
+                if (TY == 22) gu_rows_iq2s_aff<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else if (TY == 18 || TY == 21) gu_rows_phased31<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
                 else gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1);
                 return;
             case 17:   // round-10 P1: IQ3_XXS codebook loads pre-decoded across the sub-block boundary
