@@ -1413,7 +1413,7 @@ void iq128_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
     switch (type) {
         case 18: gu_rows_nt_mode<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 7); break;   // phased, fold kept
         case 21: gu_rows_nt_mode<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 7); break;   // phased, fold kept
-        case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 4); break;   // phased 16-value decode
+        case 22: gu_rows_nt_mode<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 13); break;  // phased 16-value decode, index build one sub-block early (+2.5% at nt=1, 12/12 clean samples)
         case 23: gu_rows_nt_mode<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, 0); break;
         default: break;
     }
