@@ -876,6 +876,174 @@ inline void gu_rows_iq3s_pipe(const uint8_t* blob, size_t gu_row, size_t up_off,
 }
 
 
+// MODES 17 / 18 / 19 (round 10, report-10 proposals 1-3).  Round 9 showed the loop waits on the latency chain in
+// front of vpmaddubsw, and pre-issuing the index BUILD paid +2.5% on IQ2_S.  These go one stage further: they
+// pre-decode the CODEBOOK loads (the 5-cycle L1 hit on iq3xxs_grid / iq2s_grid / iq3s_grid) across the sub-block
+// boundary, so the grid vectors for the next phase are already in registers when its multiply is issued.  Each is
+// the shipped shape with the decode moved earlier - same values, same products, same accumulator order, so the
+// bits cannot move.  The register cost is 2 extra live XMM per row carried across the boundary.
+template <int TY>
+void gu_rows_iq3xxs_gpipe(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                          float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    const int pf = prefetch_distance();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            rows_ahead(gb, pf); rows_ahead(ub, pf);
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag = _mm_setzero_si128(), au = _mm_setzero_si128();
+#define GSET4(q) _mm_set_epi32((int) iq3xxs_grid[(q)[3]], (int) iq3xxs_grid[(q)[2]], \
+                               (int) iq3xxs_grid[(q)[1]], (int) iq3xxs_grid[(q)[0]])
+            __m128i gg0 = GSET4(gb + 2), gu0 = GSET4(ub + 2);
+            for (int h = 0; h < 8; ++h) {
+                const int off = 32 * h;
+                const uint32_t wg = u32(gb + 66 + 4 * h), wu = u32(ub + 66 + 4 * h);
+                const __m128i cg = _mm_load_si128((const __m128i*) kscale16.v[wg >> 28]);
+                const __m128i cu = _mm_load_si128((const __m128i*) kscale16.v[wu >> 28]);
+                const __m128i sg0 = _mm_set_epi64x((long long) even_signs.v[(wg >> 7) & 127],
+                                                   (long long) even_signs.v[wg & 127]);
+                const __m128i su0 = _mm_set_epi64x((long long) even_signs.v[(wu >> 7) & 127],
+                                                   (long long) even_signs.v[wu & 127]);
+                const __m128i yv0 = _mm_loadu_si128((const __m128i*) (q8 + off));
+                __m128i pg = _mm_maddubs_epi16(gg0, _mm_sign_epi8(yv0, sg0));
+                __m128i pu = _mm_maddubs_epi16(gu0, _mm_sign_epi8(yv0, su0));
+                const __m128i gg1 = GSET4(gb + 6 + 8 * h), gu1 = GSET4(ub + 6 + 8 * h);
+                const __m128i sg1 = _mm_set_epi64x((long long) even_signs.v[(wg >> 21) & 127],
+                                                   (long long) even_signs.v[(wg >> 14) & 127]);
+                const __m128i su1 = _mm_set_epi64x((long long) even_signs.v[(wu >> 21) & 127],
+                                                   (long long) even_signs.v[(wu >> 14) & 127]);
+                const __m128i yv1 = _mm_loadu_si128((const __m128i*) (q8 + off + 16));
+                pg = _mm_add_epi16(pg, _mm_maddubs_epi16(gg1, _mm_sign_epi8(yv1, sg1)));
+                pu = _mm_add_epi16(pu, _mm_maddubs_epi16(gu1, _mm_sign_epi8(yv1, su1)));
+                ag = _mm_add_epi32(ag, _mm_madd_epi16(pg, cg));
+                au = _mm_add_epi32(au, _mm_madd_epi16(pu, cu));
+                if (h + 1 < 8) { gg0 = GSET4(gb + 2 + 8 * (h + 1)); gu0 = GSET4(ub + 2 + 8 * (h + 1)); }
+            }
+#undef GSET4
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy), _mm_cvtepi32_ps(ag)));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy), _mm_cvtepi32_ps(au)));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
+template <int TY>
+void gu_rows_iq2s_gpipe(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                        float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    const int pf = prefetch_distance();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            rows_ahead(gb, pf); rows_ahead(ub, pf);
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag0 = _mm_setzero_si128(), ag1 = _mm_setzero_si128();
+            __m128i au0 = _mm_setzero_si128(), au1 = _mm_setzero_si128();
+#define GSET2(v, k) _mm_set_epi64x((long long) iq2s_grid[_mm_extract_epi16(v, k + 1)], \
+                                   (long long) iq2s_grid[_mm_extract_epi16(v, k)])
+            __m128i ig = grid_idx(gb + 2, hi_spread.iq2s[gb[66]]);
+            __m128i iu = grid_idx(ub + 2, hi_spread.iq2s[ub[66]]);
+            __m128i gg0 = GSET2(ig, 0), gu0 = GSET2(iu, 0);
+            for (int h = 0; h < 8; ++h) {
+                const int off = 32 * h;
+                const uint8_t* spg = gb + 34 + 4 * h;
+                const uint8_t* spu = ub + 34 + 4 * h;
+                const uint8_t sbg = gb[74 + h], sbu = ub[74 + h];
+                const __m128i yv0 = _mm_loadu_si128((const __m128i*) (q8 + off));
+                const __m128i sg0 = _mm_set_epi64x((long long) sign8.v[spg[1]], (long long) sign8.v[spg[0]]);
+                const __m128i su0 = _mm_set_epi64x((long long) sign8.v[spu[1]], (long long) sign8.v[spu[0]]);
+                ag0 = madd_add(ag0, gg0, sg0, yv0, _mm_load_si128((const __m128i*) kscale16.v[sbg & 15]));
+                au0 = madd_add(au0, gu0, su0, yv0, _mm_load_si128((const __m128i*) kscale16.v[sbu & 15]));
+                const __m128i gg1 = GSET2(ig, 2), gu1 = GSET2(iu, 2);
+                const __m128i yv1 = _mm_loadu_si128((const __m128i*) (q8 + off + 16));
+                const __m128i sg1 = _mm_set_epi64x((long long) sign8.v[spg[3]], (long long) sign8.v[spg[2]]);
+                const __m128i su1 = _mm_set_epi64x((long long) sign8.v[spu[3]], (long long) sign8.v[spu[2]]);
+                ag1 = madd_add(ag1, gg1, sg1, yv1, _mm_load_si128((const __m128i*) kscale16.v[sbg >> 4]));
+                au1 = madd_add(au1, gu1, su1, yv1, _mm_load_si128((const __m128i*) kscale16.v[sbu >> 4]));
+                if (h + 1 < 8) {
+                    ig = grid_idx(gb + 2 + 4 * (h + 1), hi_spread.iq2s[gb[66 + h + 1]]);
+                    iu = grid_idx(ub + 2 + 4 * (h + 1), hi_spread.iq2s[ub[66 + h + 1]]);
+                    gg0 = GSET2(ig, 0); gu0 = GSET2(iu, 0);
+                }
+            }
+#undef GSET2
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(ag0, ag1))));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy),
+                                           _mm_cvtepi32_ps(_mm_add_epi32(au0, au1))));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
+template <int TY>
+void gu_rows_iq3s_dpipe(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                        float* const* ff, int r0, int r1) {
+    const block_q8_K* y0 = (const block_q8_K*) act[0];
+    const int nb = n / QK_K;
+    const int pf = prefetch_distance();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gbase = blob + (size_t) r * gu_row;
+        const uint8_t* ubase = blob + up_off + (size_t) r * gu_row;
+        __m128 fg = _mm_setzero_ps(), fu = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* gb = gbase + (size_t) i * Fmt128<TY>::bytes;
+            const uint8_t* ub = ubase + (size_t) i * Fmt128<TY>::bytes;
+            rows_ahead(gb, pf); rows_ahead(ub, pf);
+            const uint8_t* q8 = (const uint8_t*) y0[i].qs;
+            __m128i ag = _mm_setzero_si128(), au = _mm_setzero_si128();
+#define GSETW(v, m) _mm_set_epi32((int) iq3s_grid[_mm_extract_epi16(v, (m) + 3)], \
+                                  (int) iq3s_grid[_mm_extract_epi16(v, (m) + 2)], \
+                                  (int) iq3s_grid[_mm_extract_epi16(v, (m) + 1)], \
+                                  (int) iq3s_grid[_mm_extract_epi16(v, (m) + 0)])
+            __m128i ig = grid_idx(gb + 2, hi_spread.iq3s[gb[66]]);
+            __m128i iu = grid_idx(ub + 2, hi_spread.iq3s[ub[66]]);
+            for (int h = 0; h < 8; ++h) {
+                const int j = h >> 1, half = h & 1, off = 32 * h;
+                const uint32_t sgs = u32(gb + 74 + 4 * h), sgsu = u32(ub + 74 + 4 * h);
+                const uint8_t scg = gb[106 + j], scu = ub[106 + j];
+                const __m128i cg = _mm_load_si128((const __m128i*) kscale16.v[half ? scg >> 4 : scg & 15]);
+                const __m128i cu = _mm_load_si128((const __m128i*) kscale16.v[half ? scu >> 4 : scu & 15]);
+                const __m128i yv0 = _mm_loadu_si128((const __m128i*) (q8 + off));
+                __m128i pg = _mm_maddubs_epi16(GSETW(ig, 0), _mm_sign_epi8(yv0, sgn16(sgs, 0)));
+                __m128i pu = _mm_maddubs_epi16(GSETW(iu, 0), _mm_sign_epi8(yv0, sgn16(sgsu, 0)));
+                const __m128i yv1 = _mm_loadu_si128((const __m128i*) (q8 + off + 16));
+                pg = _mm_add_epi16(pg, _mm_maddubs_epi16(GSETW(ig, 4), _mm_sign_epi8(yv1, sgn16(sgs, 1))));
+                pu = _mm_add_epi16(pu, _mm_maddubs_epi16(GSETW(iu, 4), _mm_sign_epi8(yv1, sgn16(sgsu, 1))));
+                ag = _mm_add_epi32(ag, _mm_madd_epi16(pg, cg));
+                au = _mm_add_epi32(au, _mm_madd_epi16(pu, cu));
+                if (h + 1 < 8) {
+                    const int j2 = (h + 1) >> 1, h2 = (h + 1) & 1;
+                    ig = grid_idx(gb + 2 + 16 * j2 + 8 * h2, hi_spread.iq3s[gb[66 + h + 1]]);
+                    iu = grid_idx(ub + 2 + 16 * j2 + 8 * h2, hi_spread.iq3s[ub[66 + h + 1]]);
+                }
+            }
+#undef GSETW
+            const float dy = y0[i].d;
+            fg = _mm_add_ps(fg, _mm_mul_ps(_mm_set1_ps(h2f(u16(gb)) * Fmt128<TY>::K * dy), _mm_cvtepi32_ps(ag)));
+            fu = _mm_add_ps(fu, _mm_mul_ps(_mm_set1_ps(h2f(u16(ub)) * Fmt128<TY>::K * dy), _mm_cvtepi32_ps(au)));
+        }
+        float hg = hsum4(fg), hu = hsum4(fu);
+        ff[0][r] = (hg / (1.f + std::exp(-hg))) * hu;
+    }
+}
+
+
 // MODES 13 / 14 / 15 (measurement, round 9).  The report's port census says the phased loop carries 16 port-0
 // uops per 32-value unit (8 vpmaddubsw + 8 vpmaddwd + the 8 vpextrw that move grid indices out of XMM), and that
 // on Ivy vpextrw is port 0 only, so 8 of those slots are "permanently reserved".  Two of these proposals change
@@ -1136,6 +1304,23 @@ void gu_rows_nt_mode(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, 
             case 11:   // split accumulator chain (SP)
                 if (TY == 18 || TY == 21) gu_rows_phased32<TY, false, true>(blob, gu_row, up_off, n, act, ff, r0, r1);
                 else if (TY == 22) gu_rows_phased33<TY, false, true>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                return;
+            case 17:   // round-10 P1: IQ3_XXS codebook loads pre-decoded across the sub-block boundary
+                if (TY == 18) gu_rows_iq3xxs_gpipe<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else if (TY == 21) gu_rows_phased31<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else if (TY == 22) gu_rows_iq2s_pipelined<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                return;
+            case 18:   // round-10 P2: IQ2_S codebook loads pre-decoded (mode 13, one stage further)
+                if (TY == 22) gu_rows_iq2s_gpipe<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else if (TY == 18 || TY == 21) gu_rows_phased31<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                return;
+            case 19:   // round-10 P3: IQ3_S dedup + index pre-issue
+                if (TY == 21) gu_rows_iq3s_dpipe<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else if (TY == 18) gu_rows_phased31<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
+                else if (TY == 22) gu_rows_iq2s_pipelined<TY>(blob, gu_row, up_off, n, act, ff, r0, r1);
                 else gu_rows<TY, 1, 1>(blob, gu_row, up_off, n, act, ff, r0, r1);
                 return;
             case 16:   // mode 13's mechanism for IQ3_S: index build one sub-half early
